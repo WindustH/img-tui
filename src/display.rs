@@ -8,7 +8,7 @@ use crossterm::{
 use ratatui::{
   Frame, Terminal,
   backend::Backend,
-  buffer::{Buffer, CellDiffOption},
+  buffer::{Buffer, Cell, CellDiffOption},
   layout::Rect,
 };
 
@@ -22,19 +22,38 @@ pub struct ProtocolOverlayRenderer {
 #[derive(Debug, Default)]
 pub struct ProtocolFrameRenderer {
   overlays: ProtocolOverlayRenderer,
+  protected_cells: Vec<ProtectedArea>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct ProtocolFrameOutput {
   pub overlays: Vec<ProtocolOverlay>,
+  pub protocol_writes: Vec<String>,
   pub cursor_position: Option<(u16, u16)>,
+  pub preserve_overlays: bool,
+  pub preserve_areas: Vec<Rect>,
 }
 
 #[derive(Debug)]
 pub struct ProtocolOverlayCommit<'a> {
   next_state: Vec<ProtocolOverlayState>,
-  added: Vec<&'a ProtocolOverlay>,
+  writes: Vec<ProtocolOverlayWrite<'a>>,
+  removed_after_write: Vec<ProtocolOverlayState>,
   clear_areas: Vec<Rect>,
+}
+
+#[derive(Debug)]
+struct ProtocolOverlayWrite<'a> {
+  overlay: &'a ProtocolOverlay,
+  state: ProtocolOverlayState,
+  clear_areas: Vec<Rect>,
+  refresh: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ProtectedArea {
+  area: Rect,
+  cells: Vec<Cell>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,13 +72,29 @@ impl ProtocolOverlayRenderer {
     overlays: &'a [ProtocolOverlay],
   ) -> Result<ProtocolOverlayCommit<'a>> {
     let update = self.update(overlays);
+    self.commit_update(writer, update)
+  }
+
+  pub fn begin_preserving<'a>(
+    &self,
+    writer: &mut impl Write,
+    overlays: &'a [ProtocolOverlay],
+    preserve_areas: &[Rect],
+  ) -> Result<ProtocolOverlayCommit<'a>> {
+    let update = self.update_preserving(overlays, preserve_areas);
+    self.commit_update(writer, update)
+  }
+
+  fn commit_update<'a>(
+    &self,
+    writer: &mut impl Write,
+    update: ProtocolOverlayUpdate<'a>,
+  ) -> Result<ProtocolOverlayCommit<'a>> {
     erase_protocol_state(writer, &update.removed)?;
-    for area in &update.clear_areas {
-      clear_protocol_area(writer, *area)?;
-    }
     Ok(ProtocolOverlayCommit {
       next_state: update.next_state,
-      added: update.added,
+      writes: update.writes,
+      removed_after_write: update.removed_after_write,
       clear_areas: update.clear_areas,
     })
   }
@@ -69,9 +104,10 @@ impl ProtocolOverlayRenderer {
     writer: &mut impl Write,
     commit: ProtocolOverlayCommit<'_>,
   ) -> Result<()> {
-    for overlay in commit.added {
-      write_protocol_overlay(writer, overlay)?;
+    for write in commit.writes {
+      write_protocol_overlay(writer, write.overlay, &write.clear_areas, write.refresh)?;
     }
+    erase_protocol_state(writer, &commit.removed_after_write)?;
     self.state = commit.next_state;
     Ok(())
   }
@@ -86,6 +122,33 @@ impl ProtocolOverlayRenderer {
   }
 
   fn update<'a>(&self, overlays: &'a [ProtocolOverlay]) -> ProtocolOverlayUpdate<'a> {
+    self.update_with_preserved_states(overlays, Vec::new())
+  }
+
+  fn update_preserving<'a>(
+    &self,
+    overlays: &'a [ProtocolOverlay],
+    preserve_areas: &[Rect],
+  ) -> ProtocolOverlayUpdate<'a> {
+    let new_areas = overlays
+      .iter()
+      .map(|overlay| overlay.area)
+      .collect::<Vec<_>>();
+    let preserved = self
+      .state
+      .iter()
+      .filter(|state| rect_intersects_any(state.area, preserve_areas))
+      .filter(|state| !rect_intersects_any(state.area, &new_areas))
+      .cloned()
+      .collect::<Vec<_>>();
+    self.update_with_preserved_states(overlays, preserved)
+  }
+
+  fn update_with_preserved_states<'a>(
+    &self,
+    overlays: &'a [ProtocolOverlay],
+    preserved: Vec<ProtocolOverlayState>,
+  ) -> ProtocolOverlayUpdate<'a> {
     let next = overlays
       .iter()
       .map(|overlay| {
@@ -101,50 +164,77 @@ impl ProtocolOverlayRenderer {
         )
       })
       .collect::<Vec<_>>();
-    let next_state = next
+    let mut next_state = next
       .iter()
       .map(|(state, _)| state.clone())
       .collect::<Vec<_>>();
+    for state in preserved {
+      if !next_state.contains(&state) {
+        next_state.push(state);
+      }
+    }
 
     if next_state == self.state {
       return ProtocolOverlayUpdate {
         next_state,
         removed: Vec::new(),
-        added: Vec::new(),
+        removed_after_write: Vec::new(),
+        writes: Vec::new(),
         clear_areas: Vec::new(),
       };
     }
 
-    let removed = self
+    let next_areas = next_state
+      .iter()
+      .map(|state| state.area)
+      .collect::<Vec<_>>();
+    let old_areas = self
       .state
       .iter()
-      .filter(|state| !next_state.contains(state))
+      .map(|state| state.area)
+      .collect::<Vec<_>>();
+    let removed_all = self
+      .state
+      .iter()
+      .filter(|state| {
+        !next_state.contains(state)
+          && !next_state
+            .iter()
+            .any(|next| same_placement(*state, next) || same_protocol_resource(*state, next))
+      })
       .cloned()
       .collect::<Vec<_>>();
+    let removed = Vec::new();
+    let removed_after_write = removed_all;
     let mut clear_areas = Vec::new();
-    for removed_overlay in &removed {
-      if !next
-        .iter()
-        .any(|(_, overlay)| rect_contains(overlay.area, removed_overlay.area))
-      {
-        clear_areas.push(removed_overlay.area);
+    for old in &self.state {
+      if next_state.contains(old) {
+        continue;
       }
+      clear_areas.extend(subtract_rects(old.area, &next_areas));
     }
 
-    let added = if clear_areas.is_empty() {
-      next
-        .iter()
-        .filter(|(state, _)| !self.state.contains(state))
-        .map(|(_, overlay)| *overlay)
-        .collect()
-    } else {
-      next.iter().map(|(_, overlay)| *overlay).collect()
-    };
+    let writes = next
+      .iter()
+      .filter(|(state, _)| !self.state.contains(state))
+      .map(|(state, overlay)| ProtocolOverlayWrite {
+        overlay,
+        state: state.clone(),
+        clear_areas: subtract_rects(overlay.area, &old_areas),
+        refresh: overlay.refresh.is_some()
+          && self
+            .state
+            .iter()
+            .any(|old| same_placement(old, state) && old.fingerprint == state.fingerprint),
+      })
+      .collect::<Vec<_>>();
+    let writes = order_overlay_writes(writes, &self.state);
 
     ProtocolOverlayUpdate {
       next_state,
       removed,
-      added,
+      removed_after_write,
+      writes,
       clear_areas,
     }
   }
@@ -164,26 +254,83 @@ impl ProtocolFrameRenderer {
       render(&mut frame)
     };
 
+    if output.preserve_overlays && !self.overlays.is_empty() {
+      let old_areas = self.overlays.areas().collect::<Vec<_>>();
+      let new_areas = output
+        .overlays
+        .iter()
+        .map(|overlay| overlay.area)
+        .collect::<Vec<_>>();
+      let preserve_areas = if output.preserve_areas.is_empty() {
+        old_areas.clone()
+      } else {
+        output.preserve_areas.clone()
+      };
+      let preservable_old_areas = old_areas
+        .iter()
+        .copied()
+        .filter(|area| !rect_intersects_any(*area, &new_areas))
+        .collect::<Vec<_>>();
+      let protected_old_areas = intersect_rects(&preservable_old_areas, &preserve_areas);
+      let commit = {
+        let backend = terminal.backend_mut();
+        self
+          .overlays
+          .begin_preserving(backend, &output.overlays, &preserve_areas)?
+      };
+      force_update_areas(terminal.current_buffer_mut(), commit.clear_areas());
+      restore_protected_areas(
+        terminal.current_buffer_mut(),
+        &self.protected_cells,
+        protected_old_areas.iter().copied(),
+      );
+      let mut protected_snapshot_areas = new_areas;
+      protected_snapshot_areas.extend(protected_old_areas.iter().copied());
+      let protected_cells =
+        snapshot_protocol_areas(terminal.current_buffer_mut(), protected_snapshot_areas);
+
+      terminal.flush()?;
+      terminal.swap_buffers();
+
+      {
+        let backend = terminal.backend_mut();
+        write_protocol_writes(backend, &output.protocol_writes)?;
+        self.overlays.finish(backend, commit)?;
+        queue_cursor_state(backend, output.cursor_position)?;
+        Write::flush(backend)?;
+      }
+
+      self.protected_cells = protected_cells;
+      return Ok(());
+    }
+
     let commit = {
       let backend = terminal.backend_mut();
       self.overlays.begin(backend, &output.overlays)?
     };
     force_update_areas(terminal.current_buffer_mut(), commit.clear_areas());
+    let protected_cells = snapshot_protocol_areas(
+      terminal.current_buffer_mut(),
+      output.overlays.iter().map(|overlay| overlay.area),
+    );
 
     terminal.flush()?;
     terminal.swap_buffers();
 
     {
       let backend = terminal.backend_mut();
+      write_protocol_writes(backend, &output.protocol_writes)?;
       self.overlays.finish(backend, commit)?;
       queue_cursor_state(backend, output.cursor_position)?;
       Write::flush(backend)?;
     }
 
+    self.protected_cells = protected_cells;
     Ok(())
   }
 
   pub fn clear(&mut self, writer: &mut impl Write) -> Result<()> {
+    self.protected_cells.clear();
     self.overlays.clear(writer)
   }
 
@@ -203,18 +350,33 @@ impl ProtocolFrameOutput {
   pub fn new(overlays: Vec<ProtocolOverlay>, cursor_position: Option<(u16, u16)>) -> Self {
     Self {
       overlays,
+      protocol_writes: Vec::new(),
       cursor_position,
+      preserve_overlays: false,
+      preserve_areas: Vec::new(),
     }
   }
 
   pub fn without_images(mut self) -> Self {
     self.overlays.clear();
+    self.protocol_writes.clear();
+    self.preserve_areas.clear();
     self
   }
 
   pub fn without_cursor(mut self) -> Self {
     self.cursor_position = None;
     self
+  }
+}
+
+impl ProtocolOverlayRenderer {
+  fn is_empty(&self) -> bool {
+    self.state.is_empty()
+  }
+
+  fn areas(&self) -> impl Iterator<Item = Rect> + '_ {
+    self.state.iter().map(|state| state.area)
   }
 }
 
@@ -243,6 +405,84 @@ pub fn force_update_areas(buffer: &mut Buffer, areas: &[Rect]) {
   }
 }
 
+pub fn skip_protocol_areas(buffer: &mut Buffer, areas: impl IntoIterator<Item = Rect>) {
+  for area in areas {
+    for y in area.y..area.y.saturating_add(area.height) {
+      for x in area.x..area.x.saturating_add(area.width) {
+        let Some(cell) = buffer.cell_mut((x, y)) else {
+          continue;
+        };
+        cell.set_diff_option(CellDiffOption::Skip);
+      }
+    }
+  }
+}
+
+fn snapshot_protocol_areas(
+  buffer: &Buffer,
+  areas: impl IntoIterator<Item = Rect>,
+) -> Vec<ProtectedArea> {
+  areas
+    .into_iter()
+    .map(|area| {
+      let mut cells = Vec::with_capacity(usize::from(area.width) * usize::from(area.height));
+      for y in area.y..area.y.saturating_add(area.height) {
+        for x in area.x..area.x.saturating_add(area.width) {
+          cells.push(buffer.cell((x, y)).cloned().unwrap_or_default());
+        }
+      }
+      ProtectedArea { area, cells }
+    })
+    .collect()
+}
+
+fn restore_protected_areas(
+  buffer: &mut Buffer,
+  protected: &[ProtectedArea],
+  fallback_areas: impl IntoIterator<Item = Rect>,
+) {
+  for area in fallback_areas {
+    restore_protected_area(buffer, protected, area);
+  }
+}
+
+fn restore_protected_area(buffer: &mut Buffer, protected: &[ProtectedArea], area: Rect) {
+  skip_protocol_areas(buffer, [area]);
+  for snapshot in protected {
+    let Some(overlap) = rect_intersection(snapshot.area, area) else {
+      continue;
+    };
+    for y in overlap.y..overlap.y.saturating_add(overlap.height) {
+      for x in overlap.x..overlap.x.saturating_add(overlap.width) {
+        let Some(snapshot_cell) = protected_cell(snapshot, x, y) else {
+          continue;
+        };
+        let Some(cell) = buffer.cell_mut((x, y)) else {
+          continue;
+        };
+        *cell = snapshot_cell.clone();
+        cell.set_diff_option(CellDiffOption::Skip);
+      }
+    }
+  }
+}
+
+fn protected_cell(snapshot: &ProtectedArea, x: u16, y: u16) -> Option<&Cell> {
+  if x < snapshot.area.x
+    || y < snapshot.area.y
+    || x >= rect_right(snapshot.area)
+    || y >= rect_bottom(snapshot.area)
+  {
+    return None;
+  }
+  let local_x = usize::from(x.saturating_sub(snapshot.area.x));
+  let local_y = usize::from(y.saturating_sub(snapshot.area.y));
+  let width = usize::from(snapshot.area.width);
+  snapshot
+    .cells
+    .get(local_y.saturating_mul(width).saturating_add(local_x))
+}
+
 pub fn reset_protocol_images(writer: &mut impl Write, sequence: Option<&str>) -> Result<()> {
   let Some(sequence) = sequence else {
     return Ok(());
@@ -257,19 +497,210 @@ pub fn reset_protocol_images(writer: &mut impl Write, sequence: Option<&str>) ->
 struct ProtocolOverlayUpdate<'a> {
   next_state: Vec<ProtocolOverlayState>,
   removed: Vec<ProtocolOverlayState>,
-  added: Vec<&'a ProtocolOverlay>,
+  removed_after_write: Vec<ProtocolOverlayState>,
+  writes: Vec<ProtocolOverlayWrite<'a>>,
   clear_areas: Vec<Rect>,
 }
 
-fn rect_contains(outer: Rect, inner: Rect) -> bool {
-  let outer_right = outer.x.saturating_add(outer.width);
-  let outer_bottom = outer.y.saturating_add(outer.height);
-  let inner_right = inner.x.saturating_add(inner.width);
-  let inner_bottom = inner.y.saturating_add(inner.height);
-  outer.x <= inner.x
-    && outer.y <= inner.y
-    && outer_right >= inner_right
-    && outer_bottom >= inner_bottom
+fn same_placement(old: &ProtocolOverlayState, new: &ProtocolOverlayState) -> bool {
+  old.mode == new.mode
+    && matches!(
+      (&old.placement, &new.placement),
+      (
+        Some(ProtocolPlacement::KittyPlacement {
+          image_id: old_image_id,
+          placement_id: old_placement_id,
+        }),
+        Some(ProtocolPlacement::KittyPlacement {
+          image_id: new_image_id,
+          placement_id: new_placement_id,
+        })
+      ) if old_image_id == new_image_id && old_placement_id == new_placement_id
+    )
+}
+
+fn same_protocol_resource(old: &ProtocolOverlayState, new: &ProtocolOverlayState) -> bool {
+  old.mode == new.mode && old.erase.is_some() && old.erase == new.erase
+}
+
+fn order_overlay_writes<'a>(
+  writes: Vec<ProtocolOverlayWrite<'a>>,
+  old_states: &[ProtocolOverlayState],
+) -> Vec<ProtocolOverlayWrite<'a>> {
+  if writes.len() < 2 {
+    return writes;
+  }
+
+  let dependencies = write_dependencies(&writes, old_states);
+  stable_topological_order(writes, dependencies)
+}
+
+fn write_dependencies(
+  writes: &[ProtocolOverlayWrite<'_>],
+  old_states: &[ProtocolOverlayState],
+) -> Vec<Vec<usize>> {
+  let mut dependencies = vec![Vec::new(); writes.len()];
+  for (write_index, write) in writes.iter().enumerate() {
+    let vacated = old_states
+      .iter()
+      .filter(|old| same_placement(old, &write.state) || same_protocol_resource(old, &write.state))
+      .flat_map(|old| subtract_rect(old.area, write.state.area))
+      .collect::<Vec<_>>();
+    if vacated.is_empty() {
+      continue;
+    }
+    for (cover_index, cover) in writes.iter().enumerate() {
+      if cover_index == write_index {
+        continue;
+      }
+      if vacated
+        .iter()
+        .any(|area| rect_intersection(*area, cover.state.area).is_some())
+      {
+        dependencies[write_index].push(cover_index);
+      }
+    }
+  }
+  dependencies
+}
+
+fn stable_topological_order<'a>(
+  mut writes: Vec<ProtocolOverlayWrite<'a>>,
+  dependencies: Vec<Vec<usize>>,
+) -> Vec<ProtocolOverlayWrite<'a>> {
+  let len = writes.len();
+  let mut emitted = vec![false; len];
+  let mut out_indices = Vec::with_capacity(len);
+  while out_indices.len() < len {
+    let mut selected = None;
+    for index in 0..len {
+      if emitted[index] {
+        continue;
+      }
+      if dependencies[index]
+        .iter()
+        .all(|dependency| emitted[*dependency])
+      {
+        selected = Some(index);
+        break;
+      }
+    }
+    let Some(index) = selected else {
+      break;
+    };
+    emitted[index] = true;
+    out_indices.push(index);
+  }
+  for index in 0..len {
+    if !emitted[index] {
+      out_indices.push(index);
+    }
+  }
+
+  let mut slots = writes.drain(..).map(Some).collect::<Vec<_>>();
+  out_indices
+    .into_iter()
+    .filter_map(|index| slots.get_mut(index).and_then(Option::take))
+    .collect()
+}
+
+fn subtract_rects(area: Rect, covers: &[Rect]) -> Vec<Rect> {
+  let mut remaining = vec![area];
+  for cover in covers {
+    remaining = remaining
+      .into_iter()
+      .flat_map(|rect| subtract_rect(rect, *cover))
+      .collect();
+    if remaining.is_empty() {
+      break;
+    }
+  }
+  remaining
+}
+
+fn subtract_rect(area: Rect, cover: Rect) -> Vec<Rect> {
+  let Some(intersection) = rect_intersection(area, cover) else {
+    return vec![area];
+  };
+
+  let area_right = rect_right(area);
+  let area_bottom = rect_bottom(area);
+  let intersection_right = rect_right(intersection);
+  let intersection_bottom = rect_bottom(intersection);
+  let mut out = Vec::with_capacity(4);
+
+  push_rect(
+    &mut out,
+    area.x,
+    area.y,
+    area.width,
+    intersection.y.saturating_sub(area.y),
+  );
+  push_rect(
+    &mut out,
+    area.x,
+    intersection_bottom,
+    area.width,
+    area_bottom.saturating_sub(intersection_bottom),
+  );
+  push_rect(
+    &mut out,
+    area.x,
+    intersection.y,
+    intersection.x.saturating_sub(area.x),
+    intersection.height,
+  );
+  push_rect(
+    &mut out,
+    intersection_right,
+    intersection.y,
+    area_right.saturating_sub(intersection_right),
+    intersection.height,
+  );
+
+  out
+}
+
+fn intersect_rects(areas: &[Rect], clips: &[Rect]) -> Vec<Rect> {
+  let mut out = Vec::new();
+  for area in areas {
+    for clip in clips {
+      if let Some(intersection) = rect_intersection(*area, *clip) {
+        out.push(intersection);
+      }
+    }
+  }
+  out
+}
+
+fn rect_intersects_any(area: Rect, clips: &[Rect]) -> bool {
+  clips
+    .iter()
+    .any(|clip| rect_intersection(area, *clip).is_some())
+}
+
+fn rect_intersection(left: Rect, right: Rect) -> Option<Rect> {
+  let x1 = left.x.max(right.x);
+  let y1 = left.y.max(right.y);
+  let x2 = rect_right(left).min(rect_right(right));
+  let y2 = rect_bottom(left).min(rect_bottom(right));
+  let width = x2.saturating_sub(x1);
+  let height = y2.saturating_sub(y1);
+  (width > 0 && height > 0).then_some(Rect::new(x1, y1, width, height))
+}
+
+fn rect_right(area: Rect) -> u16 {
+  area.x.saturating_add(area.width)
+}
+
+fn rect_bottom(area: Rect) -> u16 {
+  area.y.saturating_add(area.height)
+}
+
+fn push_rect(out: &mut Vec<Rect>, x: u16, y: u16, width: u16, height: u16) {
+  if width > 0 && height > 0 {
+    out.push(Rect::new(x, y, width, height));
+  }
 }
 
 fn erase_protocol_state(writer: &mut impl Write, state: &[ProtocolOverlayState]) -> Result<()> {
@@ -301,15 +732,73 @@ fn clear_protocol_area(writer: &mut impl Write, area: Rect) -> Result<()> {
   Ok(())
 }
 
-fn write_protocol_overlay(writer: &mut impl Write, overlay: &ProtocolOverlay) -> Result<()> {
-  clear_protocol_area(writer, overlay.area)?;
+fn write_protocol_overlay(
+  writer: &mut impl Write,
+  overlay: &ProtocolOverlay,
+  clear_areas: &[Rect],
+  refresh: bool,
+) -> Result<()> {
+  if matches!(
+    overlay.placement,
+    Some(ProtocolPlacement::KittyPlacement { .. })
+  ) && overlay.refresh.is_some()
+  {
+    return write_kitty_placement_overlay(writer, overlay, clear_areas, refresh);
+  }
+  for area in clear_areas {
+    clear_protocol_area(writer, *area)?;
+  }
+  let data = if refresh {
+    overlay.refresh.as_deref().unwrap_or(&overlay.data)
+  } else {
+    &overlay.data
+  };
   queue!(writer, SavePosition)?;
-  move_to_protocol_area(writer, overlay.area, is_tmux_passthrough(&overlay.data))?;
-  writer.write_all(overlay.data.as_bytes())?;
-  if let Some(ProtocolPlacement::KittyUnicode { image_id }) = &overlay.placement {
+  move_to_protocol_area(writer, overlay.area, is_tmux_passthrough(data))?;
+  writer.write_all(data.as_bytes())?;
+  if !refresh && let Some(ProtocolPlacement::KittyUnicode { image_id }) = &overlay.placement {
     write_kitty_unicode_placeholders(writer, overlay.area, *image_id)?;
   }
   writer.write_all(b"\x1b[0m")?;
+  queue!(writer, RestorePosition)?;
+  Ok(())
+}
+
+fn write_kitty_placement_overlay(
+  writer: &mut impl Write,
+  overlay: &ProtocolOverlay,
+  clear_areas: &[Rect],
+  refresh: bool,
+) -> Result<()> {
+  let Some(placement) = overlay.refresh.as_deref() else {
+    return Ok(());
+  };
+
+  queue!(writer, SavePosition)?;
+  if refresh {
+    move_to_protocol_area(writer, overlay.area, is_tmux_passthrough(placement))?;
+    writer.write_all(placement.as_bytes())?;
+  } else {
+    writer.write_all(overlay.data.as_bytes())?;
+    for area in clear_areas {
+      clear_protocol_area(writer, *area)?;
+    }
+    move_to_protocol_area(writer, overlay.area, is_tmux_passthrough(placement))?;
+    writer.write_all(placement.as_bytes())?;
+  }
+  writer.write_all(b"\x1b[0m")?;
+  queue!(writer, RestorePosition)?;
+  Ok(())
+}
+
+fn write_protocol_writes(writer: &mut impl Write, writes: &[String]) -> Result<()> {
+  if writes.is_empty() {
+    return Ok(());
+  }
+  queue!(writer, SavePosition)?;
+  for write in writes {
+    writer.write_all(write.as_bytes())?;
+  }
   queue!(writer, RestorePosition)?;
   Ok(())
 }
@@ -401,4 +890,451 @@ const KITTY_DIACRITICS: &[char] = &[
 
 fn kitty_placeholder_diacritic(index: u16) -> char {
   KITTY_DIACRITICS[index as usize % KITTY_DIACRITICS.len()]
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn kitty_placement_update_only_clears_uncovered_area() {
+    let renderer = ProtocolOverlayRenderer {
+      state: vec![ProtocolOverlayState {
+        area: Rect::new(0, 0, 80, 23),
+        mode: RenderMode::Kitty,
+        placement: Some(ProtocolPlacement::KittyPlacement {
+          image_id: 7,
+          placement_id: 11,
+        }),
+        fingerprint: 1,
+        erase: Some("erase".to_string()),
+      }],
+    };
+    let overlays = vec![ProtocolOverlay {
+      area: Rect::new(0, 10, 80, 13),
+      mode: RenderMode::Kitty,
+      data: "place".to_string(),
+      refresh: None,
+      placement: Some(ProtocolPlacement::KittyPlacement {
+        image_id: 7,
+        placement_id: 11,
+      }),
+      fingerprint: 2,
+      erase: Some("erase".to_string()),
+    }];
+
+    let update = renderer.update(&overlays);
+
+    assert!(update.removed.is_empty());
+    assert_eq!(update.clear_areas, vec![Rect::new(0, 0, 80, 10)]);
+    assert_eq!(update.writes.len(), 1);
+    assert!(update.writes[0].clear_areas.is_empty());
+  }
+
+  #[test]
+  fn page_boundary_update_only_preclears_new_text_area() {
+    let renderer = ProtocolOverlayRenderer {
+      state: vec![ProtocolOverlayState {
+        area: Rect::new(0, 0, 80, 8),
+        mode: RenderMode::Kitty,
+        placement: Some(ProtocolPlacement::KittyPlacement {
+          image_id: 1,
+          placement_id: 1,
+        }),
+        fingerprint: 1,
+        erase: Some("erase-old".to_string()),
+      }],
+    };
+    let overlays = vec![
+      ProtocolOverlay {
+        area: Rect::new(0, 0, 80, 2),
+        mode: RenderMode::Kitty,
+        data: "old-page".to_string(),
+        refresh: None,
+        placement: Some(ProtocolPlacement::KittyPlacement {
+          image_id: 1,
+          placement_id: 1,
+        }),
+        fingerprint: 2,
+        erase: Some("erase-old".to_string()),
+      },
+      ProtocolOverlay {
+        area: Rect::new(0, 3, 80, 20),
+        mode: RenderMode::Kitty,
+        data: "new-page".to_string(),
+        refresh: None,
+        placement: Some(ProtocolPlacement::KittyPlacement {
+          image_id: 2,
+          placement_id: 2,
+        }),
+        fingerprint: 3,
+        erase: Some("erase-new".to_string()),
+      },
+    ];
+
+    let update = renderer.update(&overlays);
+
+    assert_eq!(update.clear_areas, vec![Rect::new(0, 2, 80, 1)]);
+    assert_eq!(update.writes.len(), 2);
+    let old_page = update
+      .writes
+      .iter()
+      .find(|write| write.overlay.data == "old-page")
+      .expect("old page write");
+    let new_page = update
+      .writes
+      .iter()
+      .find(|write| write.overlay.data == "new-page")
+      .expect("new page write");
+    assert!(old_page.clear_areas.is_empty());
+    assert_eq!(new_page.clear_areas, vec![Rect::new(0, 8, 80, 15)]);
+  }
+
+  #[test]
+  fn unchanged_kitty_placement_is_not_rewritten() {
+    let state = ProtocolOverlayState {
+      area: Rect::new(0, 0, 80, 23),
+      mode: RenderMode::Kitty,
+      placement: Some(ProtocolPlacement::KittyPlacement {
+        image_id: 7,
+        placement_id: 11,
+      }),
+      fingerprint: 1,
+      erase: Some("erase".to_string()),
+    };
+    let renderer = ProtocolOverlayRenderer {
+      state: vec![state.clone()],
+    };
+    let overlays = vec![ProtocolOverlay {
+      area: state.area,
+      mode: state.mode,
+      data: "upload-and-place".to_string(),
+      refresh: Some("place".to_string()),
+      placement: state.placement,
+      fingerprint: state.fingerprint,
+      erase: state.erase,
+    }];
+
+    let update = renderer.update(&overlays);
+
+    assert!(update.removed.is_empty());
+    assert!(update.clear_areas.is_empty());
+    assert!(update.writes.is_empty());
+  }
+
+  #[test]
+  fn moving_same_kitty_placement_uses_refresh_payload() {
+    let mut renderer = ProtocolOverlayRenderer {
+      state: vec![ProtocolOverlayState {
+        area: Rect::new(0, 0, 80, 20),
+        mode: RenderMode::Kitty,
+        placement: Some(ProtocolPlacement::KittyPlacement {
+          image_id: 7,
+          placement_id: 11,
+        }),
+        fingerprint: 1,
+        erase: Some("erase".to_string()),
+      }],
+    };
+    let overlays = vec![ProtocolOverlay {
+      area: Rect::new(0, 1, 80, 20),
+      mode: RenderMode::Kitty,
+      data: "upload-and-place".to_string(),
+      refresh: Some("place-only".to_string()),
+      placement: Some(ProtocolPlacement::KittyPlacement {
+        image_id: 7,
+        placement_id: 11,
+      }),
+      fingerprint: 1,
+      erase: Some("erase".to_string()),
+    }];
+
+    let mut begin_output = Vec::new();
+    let commit = renderer.begin(&mut begin_output, &overlays).unwrap();
+
+    assert!(begin_output.is_empty());
+    assert_eq!(commit.clear_areas(), &[Rect::new(0, 0, 80, 1)]);
+    assert_eq!(commit.writes.len(), 1);
+    assert!(commit.writes[0].refresh);
+
+    let mut finish_output = Vec::new();
+    renderer.finish(&mut finish_output, commit).unwrap();
+    let output = String::from_utf8(finish_output).unwrap();
+
+    assert!(output.contains("place-only"));
+    assert!(!output.contains("upload-and-place"));
+  }
+
+  #[test]
+  fn new_kitty_placement_uploads_before_preclear_and_place() {
+    let mut renderer = ProtocolOverlayRenderer::default();
+    let overlays = vec![ProtocolOverlay {
+      area: Rect::new(0, 0, 3, 1),
+      mode: RenderMode::Kitty,
+      data: "upload-only".to_string(),
+      refresh: Some("place-only".to_string()),
+      placement: Some(ProtocolPlacement::KittyPlacement {
+        image_id: 7,
+        placement_id: 11,
+      }),
+      fingerprint: 1,
+      erase: Some("erase".to_string()),
+    }];
+
+    let mut begin_output = Vec::new();
+    let commit = renderer.begin(&mut begin_output, &overlays).unwrap();
+
+    assert!(begin_output.is_empty());
+    assert_eq!(commit.clear_areas(), &[]);
+    assert_eq!(commit.writes.len(), 1);
+    assert!(!commit.writes[0].refresh);
+    assert_eq!(commit.writes[0].clear_areas, vec![Rect::new(0, 0, 3, 1)]);
+
+    let mut finish_output = Vec::new();
+    renderer.finish(&mut finish_output, commit).unwrap();
+    let output = String::from_utf8(finish_output).unwrap();
+
+    let upload = output.find("upload-only").expect("upload write");
+    let clear = output.find("   ").expect("preclear write");
+    let place = output.find("place-only").expect("placement write");
+    assert!(upload < clear);
+    assert!(clear < place);
+  }
+
+  #[test]
+  fn scroll_down_writes_bottom_replacement_before_moving_old_bottom() {
+    let mut renderer = ProtocolOverlayRenderer {
+      state: vec![
+        ProtocolOverlayState {
+          area: Rect::new(0, 0, 80, 10),
+          mode: RenderMode::Kitty,
+          placement: Some(ProtocolPlacement::KittyPlacement {
+            image_id: 1,
+            placement_id: 1,
+          }),
+          fingerprint: 1,
+          erase: Some("erase-a".to_string()),
+        },
+        ProtocolOverlayState {
+          area: Rect::new(0, 10, 80, 10),
+          mode: RenderMode::Kitty,
+          placement: Some(ProtocolPlacement::KittyPlacement {
+            image_id: 2,
+            placement_id: 2,
+          }),
+          fingerprint: 2,
+          erase: Some("erase-b".to_string()),
+        },
+        ProtocolOverlayState {
+          area: Rect::new(0, 20, 80, 10),
+          mode: RenderMode::Kitty,
+          placement: Some(ProtocolPlacement::KittyPlacement {
+            image_id: 3,
+            placement_id: 3,
+          }),
+          fingerprint: 3,
+          erase: Some("erase-c".to_string()),
+        },
+      ],
+    };
+    let overlays = vec![
+      ProtocolOverlay {
+        area: Rect::new(0, 0, 80, 10),
+        mode: RenderMode::Kitty,
+        data: "upload-b".to_string(),
+        refresh: Some("place-b".to_string()),
+        placement: Some(ProtocolPlacement::KittyPlacement {
+          image_id: 2,
+          placement_id: 2,
+        }),
+        fingerprint: 2,
+        erase: Some("erase-b".to_string()),
+      },
+      ProtocolOverlay {
+        area: Rect::new(0, 10, 80, 10),
+        mode: RenderMode::Kitty,
+        data: "upload-c".to_string(),
+        refresh: Some("place-c".to_string()),
+        placement: Some(ProtocolPlacement::KittyPlacement {
+          image_id: 3,
+          placement_id: 3,
+        }),
+        fingerprint: 3,
+        erase: Some("erase-c".to_string()),
+      },
+      ProtocolOverlay {
+        area: Rect::new(0, 20, 80, 10),
+        mode: RenderMode::Kitty,
+        data: "upload-d".to_string(),
+        refresh: Some("place-d".to_string()),
+        placement: Some(ProtocolPlacement::KittyPlacement {
+          image_id: 4,
+          placement_id: 4,
+        }),
+        fingerprint: 4,
+        erase: Some("erase-d".to_string()),
+      },
+    ];
+
+    let mut begin_output = Vec::new();
+    let commit = renderer.begin(&mut begin_output, &overlays).unwrap();
+
+    assert!(begin_output.is_empty());
+    assert_eq!(commit.writes.len(), 3);
+
+    let mut finish_output = Vec::new();
+    renderer.finish(&mut finish_output, commit).unwrap();
+    let output = String::from_utf8(finish_output).unwrap();
+
+    let place_d = output.find("place-d").expect("bottom replacement");
+    let place_c = output.find("place-c").expect("old bottom move");
+    let place_b = output.find("place-b").expect("middle move");
+    assert!(place_d < place_c);
+    assert!(place_c < place_b);
+    assert!(!output.contains("upload-b"));
+    assert!(!output.contains("upload-c"));
+  }
+
+  #[test]
+  fn preserving_pending_area_still_writes_ready_overlay() {
+    let old_ready_area = ProtocolOverlayState {
+      area: Rect::new(0, 0, 3, 1),
+      mode: RenderMode::Kitty,
+      placement: Some(ProtocolPlacement::KittyPlacement {
+        image_id: 1,
+        placement_id: 1,
+      }),
+      fingerprint: 1,
+      erase: Some("erase-ready".to_string()),
+    };
+    let old_pending_area = ProtocolOverlayState {
+      area: Rect::new(0, 1, 3, 1),
+      mode: RenderMode::Kitty,
+      placement: Some(ProtocolPlacement::KittyPlacement {
+        image_id: 2,
+        placement_id: 2,
+      }),
+      fingerprint: 2,
+      erase: Some("erase-pending".to_string()),
+    };
+    let renderer = ProtocolOverlayRenderer {
+      state: vec![old_ready_area, old_pending_area.clone()],
+    };
+    let overlays = vec![ProtocolOverlay {
+      area: Rect::new(0, 0, 3, 1),
+      mode: RenderMode::Kitty,
+      data: "new-ready".to_string(),
+      refresh: None,
+      placement: Some(ProtocolPlacement::KittyPlacement {
+        image_id: 3,
+        placement_id: 3,
+      }),
+      fingerprint: 3,
+      erase: Some("erase-new".to_string()),
+    }];
+
+    let update = renderer.update_preserving(&overlays, &[Rect::new(0, 1, 3, 1)]);
+
+    assert_eq!(update.writes.len(), 1);
+    assert_eq!(update.writes[0].overlay.data, "new-ready");
+    assert!(update.next_state.contains(&old_pending_area));
+    assert!(update.next_state.iter().any(|state| state.fingerprint == 3));
+    assert!(update.clear_areas.is_empty());
+  }
+
+  #[test]
+  fn moving_same_protocol_resource_does_not_erase_new_image() {
+    let renderer = ProtocolOverlayRenderer {
+      state: vec![ProtocolOverlayState {
+        area: Rect::new(0, 0, 3, 1),
+        mode: RenderMode::Kitty,
+        placement: None,
+        fingerprint: 1,
+        erase: Some("erase-image-7".to_string()),
+      }],
+    };
+    let overlays = vec![ProtocolOverlay {
+      area: Rect::new(0, 1, 3, 1),
+      mode: RenderMode::Kitty,
+      data: "same-image-new-position".to_string(),
+      refresh: None,
+      placement: None,
+      fingerprint: 1,
+      erase: Some("erase-image-7".to_string()),
+    }];
+
+    let update = renderer.update(&overlays);
+
+    assert!(update.removed_after_write.is_empty());
+    assert_eq!(update.writes.len(), 1);
+    assert_eq!(update.clear_areas, vec![Rect::new(0, 0, 3, 1)]);
+  }
+
+  #[test]
+  fn clear_areas_are_left_to_terminal_diff() {
+    let mut renderer = ProtocolOverlayRenderer {
+      state: vec![ProtocolOverlayState {
+        area: Rect::new(0, 0, 3, 2),
+        mode: RenderMode::Kitty,
+        placement: Some(ProtocolPlacement::KittyPlacement {
+          image_id: 7,
+          placement_id: 11,
+        }),
+        fingerprint: 1,
+        erase: None,
+      }],
+    };
+    let overlays = vec![ProtocolOverlay {
+      area: Rect::new(0, 1, 3, 1),
+      mode: RenderMode::Kitty,
+      data: "place".to_string(),
+      refresh: None,
+      placement: Some(ProtocolPlacement::KittyPlacement {
+        image_id: 7,
+        placement_id: 11,
+      }),
+      fingerprint: 2,
+      erase: None,
+    }];
+
+    let mut begin_output = Vec::new();
+    let commit = renderer.begin(&mut begin_output, &overlays).unwrap();
+
+    assert!(begin_output.is_empty());
+    assert_eq!(commit.clear_areas(), &[Rect::new(0, 0, 3, 1)]);
+
+    let mut finish_output = Vec::new();
+    renderer.finish(&mut finish_output, commit).unwrap();
+    let output = String::from_utf8(finish_output).unwrap();
+
+    assert!(output.contains("place"));
+    assert!(!output.contains("   "));
+  }
+
+  #[test]
+  fn protected_cells_are_restored_before_preserve_skip() {
+    let area = Rect::new(0, 0, 3, 1);
+    let mut committed = Buffer::empty(area);
+    committed[(0, 0)].set_symbol("a");
+    committed[(1, 0)].set_symbol("b");
+    committed[(2, 0)].set_symbol("c");
+    skip_protocol_areas(&mut committed, [area]);
+    let protected = snapshot_protocol_areas(&committed, [area]);
+
+    let mut next = Buffer::empty(area);
+    next[(0, 0)].set_symbol("x");
+    next[(1, 0)].set_symbol("y");
+    next[(2, 0)].set_symbol("z");
+    restore_protected_areas(&mut next, &protected, [area]);
+
+    assert_eq!(next[(0, 0)].symbol(), "a");
+    assert_eq!(next[(1, 0)].symbol(), "b");
+    assert_eq!(next[(2, 0)].symbol(), "c");
+    assert!(
+      next
+        .content()
+        .iter()
+        .all(|cell| matches!(cell.diff_option, CellDiffOption::Skip))
+    );
+  }
 }

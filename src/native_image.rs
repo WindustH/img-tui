@@ -39,6 +39,25 @@ pub struct PreparedNativeImage {
   image: Arc<DynamicImage>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NativeImageViewport {
+  pub full_width_cells: u16,
+  pub full_height_cells: u16,
+  pub visible_width_cells: u16,
+  pub visible_height_cells: u16,
+  pub left_cells: u32,
+  pub top_cells: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct KittyImageUpload {
+  pub data: Vec<u8>,
+  pub image_id: u32,
+  pub pixel_width: u32,
+  pub pixel_height: u32,
+  pub cell_pixels: Option<(u16, u16)>,
+}
+
 #[derive(Debug, Clone)]
 struct ProtocolEnvelope {
   start: &'static str,
@@ -80,6 +99,34 @@ pub async fn render(
   render_prepared(&prepared, mode, config, image_id).await
 }
 
+pub async fn render_viewport(
+  path: &Path,
+  viewport: NativeImageViewport,
+  mode: RenderMode,
+  config: &NativeImageConfig,
+  image_id: Option<u32>,
+  placement_id: Option<u32>,
+  include_kitty_upload: bool,
+) -> Result<Vec<u8>> {
+  let prepared = prepare(
+    path,
+    viewport.full_width_cells,
+    viewport.full_height_cells,
+    config.cell_pixels,
+  )
+  .await?;
+  render_prepared_viewport(
+    &prepared,
+    viewport,
+    mode,
+    config,
+    image_id,
+    placement_id,
+    include_kitty_upload,
+  )
+  .await
+}
+
 pub async fn prepare(
   path: &Path,
   width_cells: u16,
@@ -116,6 +163,122 @@ pub async fn render_prepared(
   }
 }
 
+pub async fn render_prepared_viewport(
+  prepared: &PreparedNativeImage,
+  viewport: NativeImageViewport,
+  mode: RenderMode,
+  config: &NativeImageConfig,
+  image_id: Option<u32>,
+  placement_id: Option<u32>,
+  include_kitty_upload: bool,
+) -> Result<Vec<u8>> {
+  match mode {
+    RenderMode::Kitty => {
+      let image_id = image_id.unwrap_or(1);
+      let mut out = if include_kitty_upload {
+        render_prepared_kitty_upload(prepared, config, image_id)
+          .await?
+          .data
+      } else {
+        Vec::new()
+      };
+      out.extend(render_kitty_viewport_from_geometry(
+        prepared.image.width(),
+        prepared.image.height(),
+        config.cell_pixels,
+        viewport,
+        config,
+        image_id,
+        placement_id.unwrap_or(1),
+      )?);
+      Ok(out)
+    }
+    RenderMode::Iterm2 | RenderMode::Sixel => {
+      let cropped = crop_prepared(prepared, viewport, config.cell_pixels).await?;
+      render_prepared(&cropped, mode, config, image_id).await
+    }
+    RenderMode::Symbols | RenderMode::Ascii => bail!("{} is not a native image mode", mode.label()),
+  }
+}
+
+pub async fn render_prepared_kitty_upload(
+  prepared: &PreparedNativeImage,
+  config: &NativeImageConfig,
+  image_id: u32,
+) -> Result<KittyImageUpload> {
+  let image = prepared.image.clone();
+  let envelope = ProtocolEnvelope::new(config.passthrough.as_deref());
+  let cell_pixels = config.cell_pixels;
+  tokio::task::spawn_blocking(move || {
+    let data = encode_kitty_image(
+      image.as_ref(),
+      image_id.max(1),
+      KittyTransmit::UploadOnly,
+      &envelope,
+    )?;
+    Ok(KittyImageUpload {
+      data,
+      image_id: image_id.max(1),
+      pixel_width: image.width(),
+      pixel_height: image.height(),
+      cell_pixels,
+    })
+  })
+  .await?
+}
+
+pub fn render_kitty_viewport_from_upload(
+  upload: &KittyImageUpload,
+  viewport: NativeImageViewport,
+  config: &NativeImageConfig,
+  placement_id: u32,
+) -> Result<Vec<u8>> {
+  render_kitty_viewport_from_geometry(
+    upload.pixel_width,
+    upload.pixel_height,
+    upload.cell_pixels,
+    viewport,
+    config,
+    upload.image_id,
+    placement_id,
+  )
+}
+
+pub fn render_kitty_viewport_from_geometry(
+  pixel_width: u32,
+  pixel_height: u32,
+  cell_pixels: Option<(u16, u16)>,
+  viewport: NativeImageViewport,
+  config: &NativeImageConfig,
+  image_id: u32,
+  placement_id: u32,
+) -> Result<Vec<u8>> {
+  let envelope = ProtocolEnvelope::new(config.passthrough.as_deref());
+  let pixels = pixel_viewport_for_size(pixel_width, pixel_height, viewport, cell_pixels)?;
+  encode_kitty_placement(
+    pixels,
+    viewport,
+    &envelope,
+    image_id.max(1),
+    placement_id.max(1),
+  )
+}
+
+pub async fn encode_viewport_png(
+  path: &Path,
+  viewport: NativeImageViewport,
+  cell_pixels: Option<(u16, u16)>,
+) -> Result<Vec<u8>> {
+  let prepared = prepare(
+    path,
+    viewport.full_width_cells,
+    viewport.full_height_cells,
+    cell_pixels,
+  )
+  .await?;
+  encode_prepared_viewport_png(&prepared, viewport, cell_pixels).await
+}
+
 pub fn erase_sequence(
   mode: RenderMode,
   passthrough: Option<&str>,
@@ -135,6 +298,18 @@ pub fn erase_sequence(
       envelope.start, envelope.escape, envelope.close
     ),
   })
+}
+
+pub fn erase_kitty_placement_sequence(
+  passthrough: Option<&str>,
+  image_id: u32,
+  placement_id: u32,
+) -> Option<String> {
+  let envelope = ProtocolEnvelope::new(passthrough);
+  Some(format!(
+    "{}_Gq=2,a=d,d=i,i={image_id},p={placement_id}{}\\{}",
+    envelope.start, envelope.escape, envelope.close
+  ))
 }
 
 async fn scale_to_fit(
@@ -178,7 +353,9 @@ struct DecodedImage {
 fn fit_pixel_size(image_size: (u32, u32), bounds: (u32, u32)) -> (u32, u32) {
   let (image_width, image_height) = (image_size.0.max(1), image_size.1.max(1));
   let (max_width, max_height) = (bounds.0.max(1), bounds.1.max(1));
-  let scale = (max_width as f64 / image_width as f64).min(max_height as f64 / image_height as f64);
+  let scale = (max_width as f64 / image_width as f64)
+    .min(max_height as f64 / image_height as f64)
+    .min(1.0);
   let target_width = ((image_width as f64 * scale).round() as u32).clamp(1, max_width);
   let target_height = ((image_height as f64 * scale).round() as u32).clamp(1, max_height);
   (target_width, target_height)
@@ -394,6 +571,149 @@ fn resize_algorithm(filter: FilterType) -> ResizeAlg {
   }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PixelViewport {
+  x: u32,
+  y: u32,
+  width: u32,
+  height: u32,
+}
+
+async fn crop_prepared(
+  prepared: &PreparedNativeImage,
+  viewport: NativeImageViewport,
+  cell_pixels: Option<(u16, u16)>,
+) -> Result<PreparedNativeImage> {
+  let image = prepared.image.clone();
+  tokio::task::spawn_blocking(move || {
+    let pixels = pixel_viewport(image.as_ref(), viewport, cell_pixels)?;
+    let cropped = image.crop_imm(pixels.x, pixels.y, pixels.width, pixels.height);
+    Ok(PreparedNativeImage {
+      image: Arc::new(cropped),
+    })
+  })
+  .await?
+}
+
+pub async fn encode_prepared_viewport_png(
+  prepared: &PreparedNativeImage,
+  viewport: NativeImageViewport,
+  cell_pixels: Option<(u16, u16)>,
+) -> Result<Vec<u8>> {
+  let image = prepared.image.clone();
+  tokio::task::spawn_blocking(move || {
+    let pixels = pixel_viewport(image.as_ref(), viewport, cell_pixels)?;
+    let cropped = image.crop_imm(pixels.x, pixels.y, pixels.width, pixels.height);
+    let rgba = cropped.to_rgba8();
+    let mut out = Vec::new();
+    PngEncoder::new(&mut out).write_image(
+      rgba.as_raw(),
+      rgba.width(),
+      rgba.height(),
+      ExtendedColorType::Rgba8,
+    )?;
+    Ok(out)
+  })
+  .await?
+}
+
+fn pixel_viewport(
+  image: &DynamicImage,
+  viewport: NativeImageViewport,
+  cell_pixels: Option<(u16, u16)>,
+) -> Result<PixelViewport> {
+  pixel_viewport_for_size(image.width(), image.height(), viewport, cell_pixels)
+}
+
+fn pixel_viewport_for_size(
+  pixel_width: u32,
+  pixel_height: u32,
+  viewport: NativeImageViewport,
+  _cell_pixels: Option<(u16, u16)>,
+) -> Result<PixelViewport> {
+  if pixel_width == 0 || pixel_height == 0 {
+    bail!("image is empty");
+  }
+  if viewport.visible_width_cells == 0 || viewport.visible_height_cells == 0 {
+    bail!("viewport is empty");
+  }
+
+  let full_width_cells = u32::from(viewport.full_width_cells.max(1));
+  let full_height_cells = u32::from(viewport.full_height_cells.max(1));
+  let left_cells = viewport.left_cells.min(full_width_cells);
+  let top_cells = viewport.top_cells.min(full_height_cells);
+  let visible_width_cells = u32::from(viewport.visible_width_cells.max(1));
+  let visible_height_cells = u32::from(viewport.visible_height_cells.max(1));
+  let right_cells = left_cells
+    .saturating_add(visible_width_cells)
+    .min(full_width_cells);
+  let bottom_cells = top_cells
+    .saturating_add(visible_height_cells)
+    .min(full_height_cells);
+
+  let x = scale_cells_to_pixels_floor(left_cells, full_width_cells, pixel_width);
+  let y = scale_cells_to_pixels_floor(top_cells, full_height_cells, pixel_height);
+  if x >= pixel_width || y >= pixel_height {
+    bail!("viewport starts outside image bounds");
+  }
+
+  let end_x = scale_cells_to_pixels_ceil(right_cells, full_width_cells, pixel_width);
+  let end_y = scale_cells_to_pixels_ceil(bottom_cells, full_height_cells, pixel_height);
+  let width = end_x
+    .saturating_sub(x)
+    .min(pixel_width.saturating_sub(x))
+    .max(1);
+  let height = end_y
+    .saturating_sub(y)
+    .min(pixel_height.saturating_sub(y))
+    .max(1);
+  Ok(PixelViewport {
+    x,
+    y,
+    width,
+    height,
+  })
+}
+
+fn scale_cells_to_pixels_floor(cells: u32, full_cells: u32, pixels: u32) -> u32 {
+  let full_cells = u64::from(full_cells.max(1));
+  let scaled = u64::from(cells).saturating_mul(u64::from(pixels)) / full_cells;
+  scaled.min(u64::from(pixels)).try_into().unwrap_or(pixels)
+}
+
+fn scale_cells_to_pixels_ceil(cells: u32, full_cells: u32, pixels: u32) -> u32 {
+  let full_cells = u64::from(full_cells.max(1));
+  let scaled = u64::from(cells)
+    .saturating_mul(u64::from(pixels))
+    .saturating_add(full_cells.saturating_sub(1))
+    / full_cells;
+  scaled.min(u64::from(pixels)).try_into().unwrap_or(pixels)
+}
+
+fn encode_kitty_placement(
+  pixels: PixelViewport,
+  viewport: NativeImageViewport,
+  envelope: &ProtocolEnvelope,
+  image_id: u32,
+  placement_id: u32,
+) -> Result<Vec<u8>> {
+  let mut out = Vec::new();
+  write!(
+    out,
+    "{}_Gq=2,a=p,C=1,z=-1,i={image_id},p={placement_id},x={},y={},w={},h={},c={},r={}{}\\{}",
+    envelope.start,
+    pixels.x,
+    pixels.y,
+    pixels.width,
+    pixels.height,
+    viewport.visible_width_cells,
+    viewport.visible_height_cells,
+    envelope.escape,
+    envelope.close
+  )?;
+  Ok(out)
+}
+
 async fn encode_kitty(
   image: Arc<DynamicImage>,
   envelope: &ProtocolEnvelope,
@@ -402,49 +722,47 @@ async fn encode_kitty(
 ) -> Result<Vec<u8>> {
   let envelope = envelope.clone();
   tokio::task::spawn_blocking(move || {
-    let size = (image.width(), image.height());
-    match image.as_ref() {
-      DynamicImage::ImageRgb8(image) => encode_kitty_raw(
-        image.as_raw(),
-        24,
-        size,
-        image_id,
+    encode_kitty_image(
+      image.as_ref(),
+      image_id,
+      KittyTransmit::Display {
         unicode_placeholders,
-        &envelope,
-      ),
-      DynamicImage::ImageRgba8(image) => encode_kitty_raw(
-        image.as_raw(),
-        32,
-        size,
-        image_id,
-        unicode_placeholders,
-        &envelope,
-      ),
-      image if image.color().has_alpha() => {
-        let image = image.to_rgba8();
-        encode_kitty_raw(
-          image.as_raw(),
-          32,
-          size,
-          image_id,
-          unicode_placeholders,
-          &envelope,
-        )
-      }
-      image => {
-        let image = image.to_rgb8();
-        encode_kitty_raw(
-          image.as_raw(),
-          24,
-          size,
-          image_id,
-          unicode_placeholders,
-          &envelope,
-        )
-      }
-    }
+      },
+      &envelope,
+    )
   })
   .await?
+}
+
+#[derive(Debug, Clone, Copy)]
+enum KittyTransmit {
+  Display { unicode_placeholders: bool },
+  UploadOnly,
+}
+
+fn encode_kitty_image(
+  image: &DynamicImage,
+  image_id: u32,
+  transmit: KittyTransmit,
+  envelope: &ProtocolEnvelope,
+) -> Result<Vec<u8>> {
+  let size = (image.width(), image.height());
+  match image {
+    DynamicImage::ImageRgb8(image) => {
+      encode_kitty_raw(image.as_raw(), 24, size, image_id, transmit, envelope)
+    }
+    DynamicImage::ImageRgba8(image) => {
+      encode_kitty_raw(image.as_raw(), 32, size, image_id, transmit, envelope)
+    }
+    image if image.color().has_alpha() => {
+      let image = image.to_rgba8();
+      encode_kitty_raw(image.as_raw(), 32, size, image_id, transmit, envelope)
+    }
+    image => {
+      let image = image.to_rgb8();
+      encode_kitty_raw(image.as_raw(), 24, size, image_id, transmit, envelope)
+    }
+  }
 }
 
 fn encode_kitty_raw(
@@ -452,7 +770,7 @@ fn encode_kitty_raw(
   format: u8,
   size: (u32, u32),
   image_id: u32,
-  unicode_placeholders: bool,
+  transmit: KittyTransmit,
   envelope: &ProtocolEnvelope,
 ) -> Result<Vec<u8>> {
   const RAW_CHUNK_SIZE: usize = 3072;
@@ -464,11 +782,10 @@ fn encode_kitty_raw(
   let mut out = Vec::with_capacity(encoded_len + chunk_count * 64 + 64);
   if let Some(first) = chunks.next() {
     STANDARD.encode_string(first, &mut encoded);
-    let z_index = if unicode_placeholders { "" } else { "z=-1," };
-    let unicode_placeholder = if unicode_placeholders { "U=1," } else { "" };
+    let control = kitty_transmit_control(transmit);
     write!(
       out,
-      "{}_Gq=2,a=T,{z_index}C=1,{unicode_placeholder}f={format},s={},v={},i={image_id},m={};{}{}\\{}",
+      "{}_Gq=2,{control},f={format},s={},v={},i={image_id},m={};{}{}\\{}",
       envelope.start,
       size.0,
       size.1,
@@ -494,6 +811,18 @@ fn encode_kitty_raw(
   }
 
   Ok(out)
+}
+
+fn kitty_transmit_control(transmit: KittyTransmit) -> &'static str {
+  match transmit {
+    KittyTransmit::Display {
+      unicode_placeholders: true,
+    } => "a=T,C=1,U=1",
+    KittyTransmit::Display {
+      unicode_placeholders: false,
+    } => "a=T,z=-1,C=1",
+    KittyTransmit::UploadOnly => "a=t",
+  }
 }
 
 async fn encode_iterm(image: Arc<DynamicImage>, envelope: &ProtocolEnvelope) -> Result<Vec<u8>> {
@@ -712,4 +1041,177 @@ fn write_sixel_run(out: &mut Vec<u8>, index: u8, repeat: usize, sixel_char: char
     write!(out, "#{index}{sixel_char}")?;
   }
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use std::{
+    fs,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+  };
+
+  use image::{Rgba, RgbaImage};
+
+  use super::*;
+
+  #[test]
+  fn render_viewport_supports_protocol_modes() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .build()
+      .expect("runtime");
+    runtime.block_on(async {
+      let path = test_image_path();
+      write_test_image(&path);
+
+      let config = NativeImageConfig {
+        cell_pixels: Some((4, 8)),
+        passthrough: None,
+        kitty_unicode_placeholders: false,
+      };
+      let viewport = NativeImageViewport {
+        full_width_cells: 4,
+        full_height_cells: 4,
+        visible_width_cells: 4,
+        visible_height_cells: 2,
+        left_cells: 0,
+        top_cells: 1,
+      };
+
+      let kitty = render_viewport(
+        &path,
+        viewport,
+        RenderMode::Kitty,
+        &config,
+        Some(42),
+        Some(7),
+        true,
+      )
+      .await
+      .expect("kitty viewport render");
+      let kitty = String::from_utf8(kitty).expect("kitty output is utf-8");
+      assert!(kitty.contains("a=t"));
+      assert!(kitty.contains("a=p"));
+      assert!(kitty.contains("i=42"));
+      assert!(kitty.contains("p=7"));
+      assert!(kitty.contains("x=0"));
+      assert!(kitty.contains("y=8"));
+      assert!(kitty.contains("c=4"));
+      assert!(kitty.contains("r=2"));
+
+      let prepared = prepare(&path, 4, 4, config.cell_pixels)
+        .await
+        .expect("prepare kitty upload source");
+      let upload = render_prepared_kitty_upload(&prepared, &config, 99)
+        .await
+        .expect("kitty upload");
+      let placement = render_kitty_viewport_from_upload(&upload, viewport, &config, 13)
+        .expect("kitty upload placement");
+      let placement = String::from_utf8(placement).expect("placement is utf-8");
+      assert!(!placement.contains("a=t"));
+      assert!(placement.contains("a=p"));
+      assert!(placement.contains("i=99"));
+      assert!(placement.contains("p=13"));
+      assert!(placement.contains("x=0"));
+      assert!(placement.contains("y=8"));
+
+      let sixel = render_viewport(
+        &path,
+        viewport,
+        RenderMode::Sixel,
+        &config,
+        None,
+        None,
+        false,
+      )
+      .await
+      .expect("sixel viewport render");
+      assert!(sixel.starts_with(b"\x1bP9;1q"));
+
+      let iterm = render_viewport(
+        &path,
+        viewport,
+        RenderMode::Iterm2,
+        &config,
+        None,
+        None,
+        false,
+      )
+      .await
+      .expect("iterm2 viewport render");
+      let iterm = String::from_utf8(iterm).expect("iterm output is utf-8");
+      assert!(iterm.starts_with("\x1b]1337;File=inline=1;"));
+      assert!(iterm.contains("width=16px;height=16px"));
+
+      let _ = fs::remove_file(path);
+    });
+  }
+
+  #[test]
+  fn kitty_viewport_uses_proportional_pixels_when_not_upscaled() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .build()
+      .expect("runtime");
+    runtime.block_on(async {
+      let path = test_image_path();
+      write_test_image(&path);
+
+      let config = NativeImageConfig {
+        cell_pixels: Some((4, 8)),
+        passthrough: None,
+        kitty_unicode_placeholders: false,
+      };
+      let viewport = NativeImageViewport {
+        full_width_cells: 8,
+        full_height_cells: 8,
+        visible_width_cells: 8,
+        visible_height_cells: 4,
+        left_cells: 0,
+        top_cells: 4,
+      };
+
+      let prepared = prepare(&path, 8, 8, config.cell_pixels)
+        .await
+        .expect("prepare kitty upload source");
+      let upload = render_prepared_kitty_upload(&prepared, &config, 99)
+        .await
+        .expect("kitty upload");
+      assert_eq!(upload.pixel_width, 16);
+      assert_eq!(upload.pixel_height, 32);
+
+      let placement = render_kitty_viewport_from_upload(&upload, viewport, &config, 13)
+        .expect("kitty upload placement");
+      let placement = String::from_utf8(placement).expect("placement is utf-8");
+      assert!(placement.contains("x=0"));
+      assert!(placement.contains("y=16"));
+      assert!(placement.contains("w=16"));
+      assert!(placement.contains("h=16"));
+      assert!(placement.contains("c=8"));
+      assert!(placement.contains("r=4"));
+
+      let _ = fs::remove_file(path);
+    });
+  }
+
+  fn test_image_path() -> PathBuf {
+    let nanos = SystemTime::now()
+      .duration_since(UNIX_EPOCH)
+      .expect("clock")
+      .as_nanos();
+    std::env::temp_dir().join(format!("img-tui-viewport-test-{nanos}.png"))
+  }
+
+  fn write_test_image(path: &Path) {
+    let mut image = RgbaImage::new(16, 32);
+    for y in 0..32 {
+      for x in 0..16 {
+        image.put_pixel(
+          x,
+          y,
+          Rgba([(x * 13) as u8, (y * 7) as u8, ((x + y) * 5) as u8, 255]),
+        );
+      }
+    }
+    image.save(path).expect("save test image");
+  }
 }
