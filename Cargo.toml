@@ -1,0 +1,22 @@
+[package]
+name = "img-tui"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Terminal image capability detection and image protocol rendering for TUI apps"
+repository = "https://github.com/WindustH/img-tui"
+
+[dependencies]
+anyhow = "1.0.103"
+base64 = "0.22.1"
+crossterm = "0.29.0"
+fast_image_resize = "6.0.0"
+image = "0.25.10"
+libc = "0.2.186"
+moxcms = "0.8.1"
+palette = "0.7.6"
+quantette = "0.6.0"
+ratatui = "0.30.2"
+rayon = "1.12.0"
+tokio = { version = "1.52.3", features = ["rt"] }
+tracing = "0.1.44"
