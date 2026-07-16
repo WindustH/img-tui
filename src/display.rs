@@ -360,6 +360,7 @@ impl ProtocolFrameOutput {
   pub fn without_images(mut self) -> Self {
     self.overlays.clear();
     self.protocol_writes.clear();
+    self.preserve_overlays = false;
     self.preserve_areas.clear();
     self
   }
@@ -397,9 +398,7 @@ pub fn force_update_areas(buffer: &mut Buffer, areas: &[Rect]) {
         let Some(cell) = buffer.cell_mut((x, y)) else {
           continue;
         };
-        if !matches!(cell.diff_option, CellDiffOption::Skip) {
-          cell.set_diff_option(CellDiffOption::AlwaysUpdate);
-        }
+        cell.set_diff_option(CellDiffOption::AlwaysUpdate);
       }
     }
   }
