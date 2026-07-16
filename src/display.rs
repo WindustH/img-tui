@@ -137,7 +137,7 @@ impl ProtocolOverlayRenderer {
     let preserved = self
       .state
       .iter()
-      .filter(|state| rect_intersects_any(state.area, preserve_areas))
+      .filter(|state| rect_contained_by_any(state.area, preserve_areas))
       .filter(|state| !rect_intersects_any(state.area, &new_areas))
       .cloned()
       .collect::<Vec<_>>();
@@ -269,6 +269,7 @@ impl ProtocolFrameRenderer {
       let preservable_old_areas = old_areas
         .iter()
         .copied()
+        .filter(|area| rect_contained_by_any(*area, &preserve_areas))
         .filter(|area| !rect_intersects_any(*area, &new_areas))
         .collect::<Vec<_>>();
       let protected_old_areas = intersect_rects(&preservable_old_areas, &preserve_areas);
@@ -676,6 +677,17 @@ fn rect_intersects_any(area: Rect, clips: &[Rect]) -> bool {
   clips
     .iter()
     .any(|clip| rect_intersection(area, *clip).is_some())
+}
+
+fn rect_contained_by_any(area: Rect, clips: &[Rect]) -> bool {
+  clips.iter().any(|clip| rect_contains(*clip, area))
+}
+
+fn rect_contains(outer: Rect, inner: Rect) -> bool {
+  inner.x >= outer.x
+    && inner.y >= outer.y
+    && rect_right(inner) <= rect_right(outer)
+    && rect_bottom(inner) <= rect_bottom(outer)
 }
 
 fn rect_intersection(left: Rect, right: Rect) -> Option<Rect> {
@@ -1239,6 +1251,29 @@ mod tests {
     assert!(update.next_state.contains(&old_pending_area));
     assert!(update.next_state.iter().any(|state| state.fingerprint == 3));
     assert!(update.clear_areas.is_empty());
+  }
+
+  #[test]
+  fn preserving_partial_overlap_does_not_keep_old_overlay() {
+    let old_area = ProtocolOverlayState {
+      area: Rect::new(0, 0, 10, 10),
+      mode: RenderMode::Kitty,
+      placement: Some(ProtocolPlacement::KittyPlacement {
+        image_id: 1,
+        placement_id: 1,
+      }),
+      fingerprint: 1,
+      erase: Some("erase-old".to_string()),
+    };
+    let renderer = ProtocolOverlayRenderer {
+      state: vec![old_area.clone()],
+    };
+
+    let update = renderer.update_preserving(&[], &[Rect::new(5, 5, 2, 2)]);
+
+    assert!(!update.next_state.contains(&old_area));
+    assert_eq!(update.removed_after_write, vec![old_area]);
+    assert_eq!(update.clear_areas, vec![Rect::new(0, 0, 10, 10)]);
   }
 
   #[test]
