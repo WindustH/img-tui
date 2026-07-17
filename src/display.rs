@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::{io::Write, thread, time::Duration};
 
 use anyhow::Result;
 use crossterm::{
@@ -13,6 +13,8 @@ use ratatui::{
 };
 
 use crate::{ProtocolOverlay, ProtocolPlacement, RenderMode};
+
+const TMUX_CURSOR_SYNC_DELAY: Duration = Duration::from_millis(1);
 
 #[derive(Debug, Default)]
 pub struct ProtocolOverlayRenderer {
@@ -764,14 +766,15 @@ fn write_protocol_overlay(
   } else {
     &overlay.data
   };
+  let tmux_passthrough = is_tmux_passthrough(data);
   queue!(writer, SavePosition)?;
-  move_to_protocol_area(writer, overlay.area, is_tmux_passthrough(data))?;
+  move_to_protocol_area(writer, overlay.area, tmux_passthrough)?;
   writer.write_all(data.as_bytes())?;
   if !refresh && let Some(ProtocolPlacement::KittyUnicode { image_id }) = &overlay.placement {
     write_kitty_unicode_placeholders(writer, overlay.area, *image_id)?;
   }
   writer.write_all(b"\x1b[0m")?;
-  queue!(writer, RestorePosition)?;
+  restore_protocol_cursor(writer, tmux_passthrough)?;
   Ok(())
 }
 
@@ -784,21 +787,22 @@ fn write_kitty_placement_overlay(
   let Some(placement) = overlay.refresh.as_deref() else {
     return Ok(());
   };
+  let tmux_passthrough = is_tmux_passthrough(placement);
 
   queue!(writer, SavePosition)?;
   if refresh {
-    move_to_protocol_area(writer, overlay.area, is_tmux_passthrough(placement))?;
+    move_to_protocol_area(writer, overlay.area, tmux_passthrough)?;
     writer.write_all(placement.as_bytes())?;
   } else {
     writer.write_all(overlay.data.as_bytes())?;
     for area in clear_areas {
       clear_protocol_area(writer, *area)?;
     }
-    move_to_protocol_area(writer, overlay.area, is_tmux_passthrough(placement))?;
+    move_to_protocol_area(writer, overlay.area, tmux_passthrough)?;
     writer.write_all(placement.as_bytes())?;
   }
   writer.write_all(b"\x1b[0m")?;
-  queue!(writer, RestorePosition)?;
+  restore_protocol_cursor(writer, tmux_passthrough)?;
   Ok(())
 }
 
@@ -819,9 +823,23 @@ fn move_to_protocol_area(
   area: Rect,
   tmux_passthrough: bool,
 ) -> Result<()> {
-  queue!(writer, MoveTo(area.x, area.y))?;
   if tmux_passthrough {
-    queue!(writer, MoveTo(area.x, area.y), MoveTo(area.x, area.y))?;
+    for _ in 0..3 {
+      queue!(writer, MoveTo(area.x, area.y), Show)?;
+    }
+    writer.flush()?;
+    thread::sleep(TMUX_CURSOR_SYNC_DELAY);
+  } else {
+    queue!(writer, MoveTo(area.x, area.y))?;
+  }
+  Ok(())
+}
+
+fn restore_protocol_cursor(writer: &mut impl Write, tmux_passthrough: bool) -> Result<()> {
+  if tmux_passthrough {
+    queue!(writer, Hide, RestorePosition)?;
+  } else {
+    queue!(writer, RestorePosition)?;
   }
   Ok(())
 }
