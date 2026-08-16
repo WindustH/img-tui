@@ -107,7 +107,7 @@ impl ProtocolOverlayRenderer {
     commit: ProtocolOverlayCommit<'_>,
   ) -> Result<()> {
     for write in commit.writes {
-      write_protocol_overlay(writer, write.overlay, &write.clear_areas, write.refresh)?;
+      write_protocol_overlay(writer, write.overlay, write.refresh)?;
     }
     erase_protocol_state(writer, &commit.removed_after_write)?;
     self.state = commit.next_state;
@@ -190,11 +190,6 @@ impl ProtocolOverlayRenderer {
       .iter()
       .map(|state| state.area)
       .collect::<Vec<_>>();
-    let old_areas = self
-      .state
-      .iter()
-      .map(|state| state.area)
-      .collect::<Vec<_>>();
     let removed_all = self
       .state
       .iter()
@@ -216,13 +211,23 @@ impl ProtocolOverlayRenderer {
       clear_areas.extend(subtract_rects(old.area, &next_areas));
     }
 
+    // Areas whose overlays survive unchanged keep their cells untouched
+    // (anti-flicker). Everything a fresh write covers gets pre-cleared so
+    // that transparent pixels never reveal stale cell content left behind
+    // by earlier frames.
+    let unchanged_old_areas = self
+      .state
+      .iter()
+      .filter(|old| next_state.contains(old))
+      .map(|state| state.area)
+      .collect::<Vec<_>>();
     let writes = next
       .iter()
       .filter(|(state, _)| !self.state.contains(state))
       .map(|(state, overlay)| ProtocolOverlayWrite {
         overlay,
         state: state.clone(),
-        clear_areas: subtract_rects(overlay.area, &old_areas),
+        clear_areas: subtract_rects(overlay.area, &unchanged_old_areas),
         refresh: overlay.refresh.is_some()
           && self
             .state
@@ -281,7 +286,9 @@ impl ProtocolFrameRenderer {
           .overlays
           .begin_preserving(backend, &output.overlays, &preserve_areas)?
       };
-      force_update_areas(terminal.current_buffer_mut(), commit.clear_areas());
+      let mut forced_areas = commit.clear_areas().to_vec();
+      forced_areas.extend(commit.write_clear_areas());
+      force_update_areas(terminal.current_buffer_mut(), &forced_areas);
       restore_protected_areas(
         terminal.current_buffer_mut(),
         &self.protected_cells,
@@ -311,7 +318,9 @@ impl ProtocolFrameRenderer {
       let backend = terminal.backend_mut();
       self.overlays.begin(backend, &output.overlays)?
     };
-    force_update_areas(terminal.current_buffer_mut(), commit.clear_areas());
+    let mut forced_areas = commit.clear_areas().to_vec();
+    forced_areas.extend(commit.write_clear_areas());
+    force_update_areas(terminal.current_buffer_mut(), &forced_areas);
     let protected_cells = snapshot_protocol_areas(
       terminal.current_buffer_mut(),
       output.overlays.iter().map(|overlay| overlay.area),
@@ -387,6 +396,17 @@ impl ProtocolOverlayRenderer {
 impl ProtocolOverlayCommit<'_> {
   pub fn clear_areas(&self) -> &[Rect] {
     &self.clear_areas
+  }
+
+  /// Cells that must be flushed through the regular diff before the new
+  /// overlay payloads are written, so transparent pixels expose the current
+  /// frame's styled cells instead of stale content.
+  fn write_clear_areas(&self) -> Vec<Rect> {
+    self
+      .writes
+      .iter()
+      .flat_map(|write| write.clear_areas.iter().copied())
+      .collect()
   }
 }
 
@@ -748,7 +768,6 @@ fn clear_protocol_area(writer: &mut impl Write, area: Rect) -> Result<()> {
 fn write_protocol_overlay(
   writer: &mut impl Write,
   overlay: &ProtocolOverlay,
-  clear_areas: &[Rect],
   refresh: bool,
 ) -> Result<()> {
   if matches!(
@@ -756,11 +775,11 @@ fn write_protocol_overlay(
     Some(ProtocolPlacement::KittyPlacement { .. })
   ) && overlay.refresh.is_some()
   {
-    return write_kitty_placement_overlay(writer, overlay, clear_areas, refresh);
+    return write_kitty_placement_overlay(writer, overlay, refresh);
   }
-  for area in clear_areas {
-    clear_protocol_area(writer, *area)?;
-  }
+  // Replaced overlay areas are pre-cleared by flushing the real cell
+  // content through the terminal diff (see ProtocolFrameRenderer::draw);
+  // writing plain spaces here would clobber the styled cells.
   let data = if refresh {
     overlay.refresh.as_deref().unwrap_or(&overlay.data)
   } else {
@@ -781,7 +800,6 @@ fn write_protocol_overlay(
 fn write_kitty_placement_overlay(
   writer: &mut impl Write,
   overlay: &ProtocolOverlay,
-  clear_areas: &[Rect],
   refresh: bool,
 ) -> Result<()> {
   let Some(placement) = overlay.refresh.as_deref() else {
@@ -795,9 +813,6 @@ fn write_kitty_placement_overlay(
     writer.write_all(placement.as_bytes())?;
   } else {
     writer.write_all(overlay.data.as_bytes())?;
-    for area in clear_areas {
-      clear_protocol_area(writer, *area)?;
-    }
     move_to_protocol_area(writer, overlay.area, tmux_passthrough)?;
     writer.write_all(placement.as_bytes())?;
   }
@@ -926,7 +941,7 @@ mod tests {
   use super::*;
 
   #[test]
-  fn kitty_placement_update_only_clears_uncovered_area() {
+  fn kitty_placement_update_preclears_replaced_area() {
     let renderer = ProtocolOverlayRenderer {
       state: vec![ProtocolOverlayState {
         area: Rect::new(0, 0, 80, 23),
@@ -957,7 +972,10 @@ mod tests {
     assert!(update.removed.is_empty());
     assert_eq!(update.clear_areas, vec![Rect::new(0, 0, 80, 10)]);
     assert_eq!(update.writes.len(), 1);
-    assert!(update.writes[0].clear_areas.is_empty());
+    // The replacement image has a new fingerprint: its full area must be
+    // flushed through the diff so transparent pixels cannot reveal the
+    // previous frame's cells.
+    assert_eq!(update.writes[0].clear_areas, vec![Rect::new(0, 10, 80, 13)]);
   }
 
   #[test]
@@ -1015,8 +1033,8 @@ mod tests {
       .iter()
       .find(|write| write.overlay.data == "new-page")
       .expect("new page write");
-    assert!(old_page.clear_areas.is_empty());
-    assert_eq!(new_page.clear_areas, vec![Rect::new(0, 8, 80, 15)]);
+    assert_eq!(old_page.clear_areas, vec![Rect::new(0, 0, 80, 2)]);
+    assert_eq!(new_page.clear_areas, vec![Rect::new(0, 3, 80, 20)]);
   }
 
   #[test]
@@ -1095,7 +1113,7 @@ mod tests {
   }
 
   #[test]
-  fn new_kitty_placement_uploads_before_preclear_and_place() {
+  fn new_kitty_placement_uploads_before_place() {
     let mut renderer = ProtocolOverlayRenderer::default();
     let overlays = vec![ProtocolOverlay {
       area: Rect::new(0, 0, 3, 1),
@@ -1123,11 +1141,12 @@ mod tests {
     renderer.finish(&mut finish_output, commit).unwrap();
     let output = String::from_utf8(finish_output).unwrap();
 
+    // Pre-clearing now happens through the terminal diff (real styled
+    // cells), not through raw space writes in the protocol stream.
+    assert!(!output.contains("   "));
     let upload = output.find("upload-only").expect("upload write");
-    let clear = output.find("   ").expect("preclear write");
     let place = output.find("place-only").expect("placement write");
-    assert!(upload < clear);
-    assert!(clear < place);
+    assert!(upload < place);
   }
 
   #[test]
