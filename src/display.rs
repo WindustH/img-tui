@@ -288,6 +288,11 @@ impl ProtocolFrameRenderer {
       };
       let mut forced_areas = commit.clear_areas().to_vec();
       forced_areas.extend(commit.write_clear_areas());
+      let repaint_overlays = flush_stale_overlay_cells(
+        terminal.current_buffer_mut(),
+        &output.overlays,
+        &self.protected_cells,
+      );
       force_update_areas(terminal.current_buffer_mut(), &forced_areas);
       restore_protected_areas(
         terminal.current_buffer_mut(),
@@ -306,6 +311,9 @@ impl ProtocolFrameRenderer {
         let backend = terminal.backend_mut();
         write_protocol_writes(backend, &output.protocol_writes)?;
         self.overlays.finish(backend, commit)?;
+        for index in repaint_overlays {
+          write_protocol_overlay(backend, &output.overlays[index], false)?;
+        }
         queue_cursor_state(backend, output.cursor_position)?;
         Write::flush(backend)?;
       }
@@ -320,6 +328,11 @@ impl ProtocolFrameRenderer {
     };
     let mut forced_areas = commit.clear_areas().to_vec();
     forced_areas.extend(commit.write_clear_areas());
+    let repaint_overlays = flush_stale_overlay_cells(
+      terminal.current_buffer_mut(),
+      &output.overlays,
+      &self.protected_cells,
+    );
     force_update_areas(terminal.current_buffer_mut(), &forced_areas);
     let protected_cells = snapshot_protocol_areas(
       terminal.current_buffer_mut(),
@@ -333,6 +346,9 @@ impl ProtocolFrameRenderer {
       let backend = terminal.backend_mut();
       write_protocol_writes(backend, &output.protocol_writes)?;
       self.overlays.finish(backend, commit)?;
+      for index in repaint_overlays {
+        write_protocol_overlay(backend, &output.overlays[index], false)?;
+      }
       queue_cursor_state(backend, output.cursor_position)?;
       Write::flush(backend)?;
     }
@@ -487,6 +503,48 @@ fn restore_protected_area(buffer: &mut Buffer, protected: &[ProtectedArea], area
       }
     }
   }
+}
+
+/// Cells under live overlays are diff-skipped, so styling changes beneath an
+/// unchanged image (hover/selection backgrounds) would never reach the
+/// terminal, and stale styling can leak through transparent pixels. Compare
+/// the desired cells with what we last flushed under each overlay and
+/// force-update the changed ones. Returns indices of overlays whose pixels
+/// must be re-placed afterwards because flushing cells damages them
+/// (sixel / iTerm2 composite below text).
+fn flush_stale_overlay_cells(
+  buffer: &mut Buffer,
+  overlays: &[ProtocolOverlay],
+  flushed: &[ProtectedArea],
+) -> Vec<usize> {
+  let mut repaint = Vec::new();
+  for (index, overlay) in overlays.iter().enumerate() {
+    let Some(snapshot) = flushed.iter().find(|snap| snap.area == overlay.area) else {
+      continue;
+    };
+    let mut changed = false;
+    for y in overlay.area.y..rect_bottom(overlay.area) {
+      for x in overlay.area.x..rect_right(overlay.area) {
+        let Some(desired) = buffer.cell((x, y)) else {
+          continue;
+        };
+        let Some(known) = protected_cell(snapshot, x, y) else {
+          continue;
+        };
+        if desired.symbol() == known.symbol() && desired.style() == known.style() {
+          continue;
+        }
+        if let Some(cell) = buffer.cell_mut((x, y)) {
+          cell.set_diff_option(CellDiffOption::AlwaysUpdate);
+        }
+        changed = true;
+      }
+    }
+    if changed && overlay.mode != RenderMode::Kitty {
+      repaint.push(index);
+    }
+  }
+  repaint
 }
 
 fn protected_cell(snapshot: &ProtectedArea, x: u16, y: u16) -> Option<&Cell> {
@@ -939,6 +997,7 @@ fn kitty_placeholder_diacritic(index: u16) -> char {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use ratatui::style::{Color, Style};
 
   #[test]
   fn kitty_placement_update_preclears_replaced_area() {
@@ -1380,6 +1439,75 @@ mod tests {
 
     assert!(output.contains("place"));
     assert!(!output.contains("   "));
+  }
+
+  #[test]
+  fn stale_cells_under_unchanged_overlay_are_flushed() {
+    let area = Rect::new(0, 0, 2, 1);
+    let mut flushed_frame = Buffer::empty(area);
+    flushed_frame[(0, 0)].set_symbol("a");
+    flushed_frame[(1, 0)].set_symbol("b");
+    let flushed = snapshot_protocol_areas(&flushed_frame, [area]);
+
+    // Desired frame: first cell restyled (hover background), second cell
+    // identical; both marked Skip because an overlay covers them.
+    let mut desired = Buffer::empty(area);
+    desired[(0, 0)].set_symbol("a");
+    desired[(0, 0)].set_style(Style::default().bg(Color::Yellow));
+    desired[(1, 0)].set_symbol("b");
+    skip_protocol_areas(&mut desired, [area]);
+
+    let overlay = |mode: RenderMode| ProtocolOverlay {
+      area,
+      mode,
+      data: "payload".to_string(),
+      refresh: None,
+      placement: None,
+      fingerprint: 7,
+      erase: None,
+    };
+
+    let mut sixel_buffer = desired.clone();
+    let repaint =
+      flush_stale_overlay_cells(&mut sixel_buffer, &[overlay(RenderMode::Sixel)], &flushed);
+    assert_eq!(repaint, vec![0]);
+    assert!(matches!(
+      sixel_buffer[(0, 0)].diff_option,
+      CellDiffOption::AlwaysUpdate
+    ));
+    assert!(matches!(sixel_buffer[(1, 0)].diff_option, CellDiffOption::Skip));
+
+    // Kitty composites above text, so the flushed cells cannot damage the
+    // image and no re-placement is needed.
+    let mut kitty_buffer = desired;
+    let repaint =
+      flush_stale_overlay_cells(&mut kitty_buffer, &[overlay(RenderMode::Kitty)], &flushed);
+    assert!(repaint.is_empty());
+    assert!(matches!(
+      kitty_buffer[(0, 0)].diff_option,
+      CellDiffOption::AlwaysUpdate
+    ));
+  }
+
+  #[test]
+  fn stale_cells_without_snapshot_are_left_alone() {
+    let area = Rect::new(0, 0, 2, 1);
+    let mut buffer = Buffer::empty(area);
+    buffer[(0, 0)].set_style(Style::default().bg(Color::Red));
+    skip_protocol_areas(&mut buffer, [area]);
+    let overlay = ProtocolOverlay {
+      area,
+      mode: RenderMode::Iterm2,
+      data: "payload".to_string(),
+      refresh: None,
+      placement: None,
+      fingerprint: 1,
+      erase: None,
+    };
+
+    let repaint = flush_stale_overlay_cells(&mut buffer, &[overlay], &[]);
+    assert!(repaint.is_empty());
+    assert!(matches!(buffer[(0, 0)].diff_option, CellDiffOption::Skip));
   }
 
   #[test]
