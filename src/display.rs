@@ -202,7 +202,7 @@ impl ProtocolOverlayRenderer {
         !next_state.contains(state)
           && !next_state
             .iter()
-            .any(|next| same_placement(*state, next) || same_protocol_resource(*state, next))
+            .any(|next| same_placement(state, next) || same_protocol_resource(state, next))
       })
       .cloned()
       .collect::<Vec<_>>();
@@ -593,8 +593,8 @@ fn stable_topological_order<'a>(
     emitted[index] = true;
     out_indices.push(index);
   }
-  for index in 0..len {
-    if !emitted[index] {
+  for (index, emitted_flag) in emitted.iter().enumerate().take(len) {
+    if !emitted_flag {
       out_indices.push(index);
     }
   }
