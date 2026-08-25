@@ -1,4 +1,12 @@
-use std::{fmt::Write as FmtWrite, io::Write as IoWrite, path::Path, sync::Arc};
+use std::{
+  collections::HashMap,
+  fmt::Write as FmtWrite,
+  hash::{DefaultHasher, Hash, Hasher},
+  io::Write as IoWrite,
+  path::Path,
+  sync::{Arc, Mutex, OnceLock},
+  time::{SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -63,6 +71,46 @@ struct ProtocolEnvelope {
   start: &'static str,
   escape: &'static str,
   close: &'static str,
+}
+
+#[derive(Debug)]
+struct KittyImageIdRegistry {
+  next: u32,
+  by_key: HashMap<Vec<u8>, u32>,
+}
+
+/// Allocate a process-unique kitty image id for a stable resource key.
+///
+/// Unicode placeholders can carry the full 32-bit id (the low 24 bits in
+/// their foreground color and the high byte in a third diacritic). Keeping a
+/// registry avoids birthday collisions when an application, such as a PDF
+/// viewer, has thousands of images alive in one terminal session. A
+/// per-process starting point also prevents stale virtual placements left by
+/// a crashed earlier process from being selected for a new image.
+pub fn kitty_image_id(key: &[u8]) -> u32 {
+  static IDS: OnceLock<Mutex<KittyImageIdRegistry>> = OnceLock::new();
+  let ids = IDS.get_or_init(|| {
+    let mut hasher = DefaultHasher::new();
+    std::process::id().hash(&mut hasher);
+    SystemTime::now()
+      .duration_since(UNIX_EPOCH)
+      .unwrap_or_default()
+      .as_nanos()
+      .hash(&mut hasher);
+    let next = (hasher.finish() as u32).max(1);
+    Mutex::new(KittyImageIdRegistry {
+      next,
+      by_key: HashMap::new(),
+    })
+  });
+  let mut ids = ids.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+  if let Some(id) = ids.by_key.get(key) {
+    return *id;
+  }
+  let id = ids.next.max(1);
+  ids.next = id.wrapping_add(1).max(1);
+  ids.by_key.insert(key.to_vec(), id);
+  id
 }
 
 impl ProtocolEnvelope {
@@ -262,6 +310,30 @@ pub fn render_kitty_viewport_from_geometry(
     image_id.max(1),
     placement_id.max(1),
   )
+}
+
+/// Encode a *virtual* placement (kitty U=1): an invisible prototype scaling
+/// the image to `cols` x `rows` cells. Actual display happens via unicode
+/// placeholder text cells referencing `image_id` (see display.rs).
+pub fn render_kitty_virtual_placement(
+  config: &NativeImageConfig,
+  image_id: u32,
+  cols: u16,
+  rows: u16,
+) -> Vec<u8> {
+  let envelope = ProtocolEnvelope::new(config.passthrough.as_deref());
+  let mut out = Vec::new();
+  let _ = write!(
+    out,
+    "{}_Gq=2,a=p,U=1,i={},c={},r={}{}\\{}",
+    envelope.start,
+    image_id.max(1),
+    cols.max(1),
+    rows.max(1),
+    envelope.escape,
+    envelope.close
+  );
+  out
 }
 
 pub async fn encode_viewport_png(
@@ -1054,6 +1126,17 @@ mod tests {
   use image::{Rgba, RgbaImage};
 
   use super::*;
+
+  #[test]
+  fn kitty_image_ids_are_stable_and_unique_within_process() {
+    let first = kitty_image_id(b"img-tui-test-resource-a");
+    let first_again = kitty_image_id(b"img-tui-test-resource-a");
+    let second = kitty_image_id(b"img-tui-test-resource-b");
+
+    assert_ne!(first, 0);
+    assert_eq!(first, first_again);
+    assert_ne!(first, second);
+  }
 
   #[test]
   fn render_viewport_supports_protocol_modes() {

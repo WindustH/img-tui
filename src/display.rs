@@ -11,6 +11,7 @@ use ratatui::{
   buffer::{Buffer, Cell, CellDiffOption},
   layout::Rect,
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::{ProtocolOverlay, ProtocolPlacement, RenderMode};
 
@@ -34,6 +35,8 @@ pub struct ProtocolFrameOutput {
   pub cursor_position: Option<(u16, u16)>,
   pub preserve_overlays: bool,
   pub preserve_areas: Vec<Rect>,
+  /// Modal rectangles whose text cells replace kitty U=1 placeholders.
+  pub occluders: Vec<Rect>,
 }
 
 #[derive(Debug)]
@@ -50,6 +53,7 @@ struct ProtocolOverlayWrite<'a> {
   state: ProtocolOverlayState,
   clear_areas: Vec<Rect>,
   refresh: bool,
+  prewritten: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -90,9 +94,19 @@ impl ProtocolOverlayRenderer {
   fn commit_update<'a>(
     &self,
     writer: &mut impl Write,
-    update: ProtocolOverlayUpdate<'a>,
+    mut update: ProtocolOverlayUpdate<'a>,
   ) -> Result<ProtocolOverlayCommit<'a>> {
     erase_protocol_state(writer, &update.removed)?;
+    // U=1 placeholders must not reach the terminal before their image and
+    // virtual placement exist. Write those protocol resources first; the
+    // regular terminal diff that follows will then reveal the image without
+    // a blank intermediate frame.
+    for write in &mut update.writes {
+      if is_kitty_unicode(write.overlay.placement.as_ref()) {
+        write_protocol_overlay(writer, write.overlay, write.refresh)?;
+        write.prewritten = true;
+      }
+    }
     Ok(ProtocolOverlayCommit {
       next_state: update.next_state,
       writes: update.writes,
@@ -107,7 +121,9 @@ impl ProtocolOverlayRenderer {
     commit: ProtocolOverlayCommit<'_>,
   ) -> Result<()> {
     for write in commit.writes {
-      write_protocol_overlay(writer, write.overlay, write.refresh)?;
+      if !write.prewritten {
+        write_protocol_overlay(writer, write.overlay, write.refresh)?;
+      }
     }
     erase_protocol_state(writer, &commit.removed_after_write)?;
     self.state = commit.next_state;
@@ -205,7 +221,7 @@ impl ProtocolOverlayRenderer {
     let removed_after_write = removed_all;
     let mut clear_areas = Vec::new();
     for old in &self.state {
-      if next_state.contains(old) {
+      if next_state.contains(old) || is_kitty_unicode(old.placement.as_ref()) {
         continue;
       }
       clear_areas.extend(subtract_rects(old.area, &next_areas));
@@ -227,12 +243,17 @@ impl ProtocolOverlayRenderer {
       .map(|(state, overlay)| ProtocolOverlayWrite {
         overlay,
         state: state.clone(),
-        clear_areas: subtract_rects(overlay.area, &unchanged_old_areas),
+        clear_areas: if is_kitty_unicode(state.placement.as_ref()) {
+          Vec::new()
+        } else {
+          subtract_rects(overlay.area, &unchanged_old_areas)
+        },
         refresh: overlay.refresh.is_some()
           && self
             .state
             .iter()
             .any(|old| same_placement(old, state) && old.fingerprint == state.fingerprint),
+        prewritten: false,
       })
       .collect::<Vec<_>>();
     let writes = order_overlay_writes(writes, &self.state);
@@ -260,6 +281,21 @@ impl ProtocolFrameRenderer {
       let mut frame = terminal.get_frame();
       render(&mut frame)
     };
+    // A wide glyph rendered immediately to the left of an opaque surface
+    // occupies the surface's first cell as well. Ratatui otherwise sees the
+    // wide leading cell first and skips that first popup cell while diffing.
+    // Clip the whole underlying glyph so every modal boundary is valid even
+    // when no protocol image exists beneath it.
+    clip_wide_glyphs_crossing_occluder_left_edges(terminal.current_buffer_mut(), &output.occluders);
+    // U=1 kitty images display through unicode placeholder *text cells*.
+    // Fill them after the render closure (modal dialogs painted by the app
+    // keep their cells, clipping the image there) and before the diff flush
+    // (the text diff then carries placeholder/restore updates for free).
+    fill_kitty_unicode_placeholders(
+      terminal.current_buffer_mut(),
+      &output.overlays,
+      &output.occluders,
+    );
 
     if output.preserve_overlays && !self.overlays.is_empty() {
       let old_areas = self.overlays.areas().collect::<Vec<_>>();
@@ -382,6 +418,7 @@ impl ProtocolFrameOutput {
       cursor_position,
       preserve_overlays: false,
       preserve_areas: Vec::new(),
+      occluders: Vec::new(),
     }
   }
 
@@ -390,6 +427,7 @@ impl ProtocolFrameOutput {
     self.protocol_writes.clear();
     self.preserve_overlays = false;
     self.preserve_areas.clear();
+    self.occluders.clear();
     self
   }
 
@@ -519,6 +557,14 @@ fn flush_stale_overlay_cells(
 ) -> Vec<usize> {
   let mut repaint = Vec::new();
   for (index, overlay) in overlays.iter().enumerate() {
+    // U=1 placeholders live in the text buffer; there is no post-flush
+    // damage to repair.
+    if matches!(
+      &overlay.placement,
+      Some(ProtocolPlacement::KittyUnicode { .. })
+    ) {
+      continue;
+    }
     let Some(snapshot) = flushed.iter().find(|snap| snap.area == overlay.area) else {
       continue;
     };
@@ -584,7 +630,7 @@ struct ProtocolOverlayUpdate<'a> {
 
 fn same_placement(old: &ProtocolOverlayState, new: &ProtocolOverlayState) -> bool {
   old.mode == new.mode
-    && matches!(
+    && (matches!(
       (&old.placement, &new.placement),
       (
         Some(ProtocolPlacement::KittyPlacement {
@@ -596,7 +642,21 @@ fn same_placement(old: &ProtocolOverlayState, new: &ProtocolOverlayState) -> boo
           placement_id: new_placement_id,
         })
       ) if old_image_id == new_image_id && old_placement_id == new_placement_id
-    )
+    ) || matches!(
+      (&old.placement, &new.placement),
+      (
+        Some(ProtocolPlacement::KittyUnicode {
+          image_id: old_image_id,
+        }),
+        Some(ProtocolPlacement::KittyUnicode {
+          image_id: new_image_id,
+        })
+      ) if old_image_id == new_image_id
+    ))
+}
+
+fn is_kitty_unicode(placement: Option<&ProtocolPlacement>) -> bool {
+  matches!(placement, Some(ProtocolPlacement::KittyUnicode { .. }))
 }
 
 fn same_protocol_resource(old: &ProtocolOverlayState, new: &ProtocolOverlayState) -> bool {
@@ -828,6 +888,18 @@ fn write_protocol_overlay(
   overlay: &ProtocolOverlay,
   refresh: bool,
 ) -> Result<()> {
+  // A U=1 image's screen position comes entirely from its placeholder text
+  // cells. When the same image moves, the regular terminal diff relocates
+  // those cells; creating another virtual placement would be redundant and
+  // can leave multiple placements competing for the same image id.
+  if refresh
+    && matches!(
+      overlay.placement,
+      Some(ProtocolPlacement::KittyUnicode { .. })
+    )
+  {
+    return Ok(());
+  }
   if matches!(
     overlay.placement,
     Some(ProtocolPlacement::KittyPlacement { .. })
@@ -847,9 +919,6 @@ fn write_protocol_overlay(
   queue!(writer, SavePosition)?;
   move_to_protocol_area(writer, overlay.area, tmux_passthrough)?;
   writer.write_all(data.as_bytes())?;
-  if !refresh && let Some(ProtocolPlacement::KittyUnicode { image_id }) = &overlay.placement {
-    write_kitty_unicode_placeholders(writer, overlay.area, *image_id)?;
-  }
   writer.write_all(b"\x1b[0m")?;
   restore_protocol_cursor(writer, tmux_passthrough)?;
   Ok(())
@@ -921,35 +990,132 @@ fn is_tmux_passthrough(data: &str) -> bool {
   data.starts_with("\x1bPtmux;")
 }
 
-fn write_kitty_unicode_placeholders(
-  writer: &mut impl Write,
-  area: Rect,
-  image_id: u32,
-) -> Result<()> {
-  if area.width == 0 || area.height == 0 {
-    return Ok(());
-  }
-
-  let red = (image_id >> 16) & 0xff;
-  let green = (image_id >> 8) & 0xff;
-  let blue = image_id & 0xff;
-  write!(writer, "\x1b[0m\x1b[38;2;{red};{green};{blue}m")?;
-
-  for y in 0..area.height {
-    queue!(writer, MoveTo(area.x, area.y.saturating_add(y)))?;
-    let row = kitty_placeholder_diacritic(y);
-    for x in 0..area.width {
-      write!(
-        writer,
-        "{}{}{}",
-        KITTY_PLACEHOLDER,
-        row,
-        kitty_placeholder_diacritic(x)
-      )?;
+/// Fill U=1 kitty overlay areas with unicode placeholder *text cells*:
+/// U+10EEEE plus row and column diacritics, image id encoded as the
+/// truecolor foreground. Cells covered by a modal occluder keep the modal
+/// content (the image is clipped there); when the modal closes, the pane
+/// repaints blank cells and the next frame re-fills them — exactly how
+/// yazi handles image/dialog overlap.
+fn fill_kitty_unicode_placeholders(
+  buffer: &mut Buffer,
+  overlays: &[ProtocolOverlay],
+  occluders: &[Rect],
+) {
+  for overlay in overlays {
+    let image_id = match &overlay.placement {
+      Some(ProtocolPlacement::KittyUnicode { image_id }) => *image_id,
+      _ => continue,
+    };
+    if overlay.area.width == 0 || overlay.area.height == 0 {
+      continue;
+    }
+    let color = ratatui::style::Color::Rgb(
+      ((image_id >> 16) & 0xff) as u8,
+      ((image_id >> 8) & 0xff) as u8,
+      (image_id & 0xff) as u8,
+    );
+    for y in overlay.area.y..(overlay.area.y + overlay.area.height) {
+      let text_owned = wide_text_owned_placeholder_cells(buffer, overlay.area, occluders, y);
+      let row = kitty_placeholder_diacritic(y - overlay.area.y);
+      for x in overlay.area.x..(overlay.area.x + overlay.area.width) {
+        let occluded = occluders.iter().any(|occluder| {
+          x >= occluder.x
+            && x < occluder.x + occluder.width
+            && y >= occluder.y
+            && y < occluder.y + occluder.height
+        });
+        let local_x = usize::from(x - overlay.area.x);
+        if occluded || text_owned.get(local_x).copied().unwrap_or(false) {
+          if let Some(cell) = buffer.cell_mut((x, y)) {
+            cell.set_diff_option(CellDiffOption::None);
+          }
+          continue;
+        }
+        let symbol = format!(
+          "{KITTY_PLACEHOLDER}{row}{}{}",
+          kitty_placeholder_diacritic(x - overlay.area.x),
+          kitty_placeholder_diacritic(((image_id >> 24) & 0xff) as u16)
+        );
+        if let Some(cell) = buffer.cell_mut((x, y)) {
+          cell.set_symbol(&symbol);
+          cell.set_fg(color);
+          // Kitty interprets underline color as a placement id. Never let a
+          // style inherited from the underlying widget select an unrelated
+          // virtual placement.
+          cell.underline_color = ratatui::style::Color::Reset;
+          cell.set_diff_option(CellDiffOption::None);
+        }
+      }
     }
   }
+}
 
-  Ok(())
+fn clip_wide_glyphs_crossing_occluder_left_edges(buffer: &mut Buffer, occluders: &[Rect]) {
+  let buffer_left = buffer.area().x;
+  for occluder in occluders {
+    if occluder.x <= buffer_left || occluder.width == 0 || occluder.height == 0 {
+      continue;
+    }
+    let x = occluder.x - 1;
+    for y in occluder.y..rect_bottom(*occluder) {
+      let Some(cell) = buffer.cell_mut((x, y)) else {
+        continue;
+      };
+      if UnicodeWidthStr::width(cell.symbol()) <= 1 {
+        continue;
+      }
+      cell.set_symbol(" ");
+      cell.set_diff_option(CellDiffOption::None);
+    }
+  }
+}
+
+/// Preserve all cells occupied by a wide glyph whose leading cell belongs to
+/// text rather than to the image. This expands a modal/text boundary by the
+/// glyph's continuation cells and prevents Ratatui from skipping a U=1
+/// placeholder halfway through a CJK character or emoji.
+fn wide_text_owned_placeholder_cells(
+  buffer: &Buffer,
+  area: Rect,
+  occluders: &[Rect],
+  y: u16,
+) -> Vec<bool> {
+  let mut owned = vec![false; usize::from(area.width)];
+  let scan_left = buffer.area().x;
+  let scan_right = rect_right(area).min(rect_right(*buffer.area()));
+  for x in scan_left..scan_right {
+    let Some(cell) = buffer.cell((x, y)) else {
+      continue;
+    };
+    let width = UnicodeWidthStr::width(cell.symbol());
+    if width <= 1 || placeholder_cell(area, occluders, x, y) {
+      continue;
+    }
+    for offset in 1..width {
+      let target = x.saturating_add(offset.min(usize::from(u16::MAX)) as u16);
+      if target >= rect_right(area) {
+        break;
+      }
+      if placeholder_cell(area, occluders, target, y) {
+        owned[usize::from(target - area.x)] = true;
+      }
+    }
+  }
+  owned
+}
+
+fn placeholder_cell(area: Rect, occluders: &[Rect], x: u16, y: u16) -> bool {
+  x >= area.x
+    && x < rect_right(area)
+    && y >= area.y
+    && y < rect_bottom(area)
+    && !occluders
+      .iter()
+      .any(|occluder| rect_contains_position(*occluder, x, y))
+}
+
+fn rect_contains_position(area: Rect, x: u16, y: u16) -> bool {
+  x >= area.x && x < rect_right(area) && y >= area.y && y < rect_bottom(area)
 }
 
 fn queue_cursor_state(writer: &mut impl Write, cursor_position: Option<(u16, u16)>) -> Result<()> {
@@ -962,32 +1128,303 @@ fn queue_cursor_state(writer: &mut impl Write, cursor_position: Option<(u16, u16
 
 const KITTY_PLACEHOLDER: char = '\u{10EEEE}';
 const KITTY_DIACRITICS: &[char] = &[
-  '\u{0305}', '\u{030D}', '\u{030E}', '\u{0310}', '\u{0312}', '\u{033D}', '\u{033E}', '\u{033F}',
-  '\u{0346}', '\u{034A}', '\u{034B}', '\u{034C}', '\u{0350}', '\u{0351}', '\u{0352}', '\u{0357}',
-  '\u{035B}', '\u{0363}', '\u{0364}', '\u{0365}', '\u{0366}', '\u{0367}', '\u{0368}', '\u{0369}',
-  '\u{036A}', '\u{036B}', '\u{036C}', '\u{036D}', '\u{036E}', '\u{036F}', '\u{0483}', '\u{0484}',
-  '\u{0485}', '\u{0486}', '\u{0487}', '\u{0592}', '\u{0593}', '\u{0594}', '\u{0595}', '\u{0597}',
-  '\u{0598}', '\u{0599}', '\u{059C}', '\u{059D}', '\u{059E}', '\u{059F}', '\u{05A0}', '\u{05A1}',
-  '\u{05A8}', '\u{05A9}', '\u{05AB}', '\u{05AC}', '\u{05AF}', '\u{05C4}', '\u{0610}', '\u{0611}',
-  '\u{0612}', '\u{0613}', '\u{0614}', '\u{0615}', '\u{0616}', '\u{0617}', '\u{0618}', '\u{0619}',
-  '\u{061A}', '\u{064B}', '\u{064C}', '\u{064D}', '\u{064E}', '\u{064F}', '\u{0650}', '\u{0651}',
-  '\u{0652}', '\u{0653}', '\u{0654}', '\u{0655}', '\u{0656}', '\u{0657}', '\u{0658}', '\u{0659}',
-  '\u{065A}', '\u{065B}', '\u{065C}', '\u{065D}', '\u{065E}', '\u{06D6}', '\u{06D7}', '\u{06D8}',
-  '\u{06D9}', '\u{06DA}', '\u{06DB}', '\u{06DC}', '\u{06DF}', '\u{06E0}', '\u{06E1}', '\u{06E2}',
-  '\u{06E3}', '\u{06E4}', '\u{06E7}', '\u{06E8}', '\u{06EA}', '\u{06EB}', '\u{06EC}', '\u{0730}',
-  '\u{0731}', '\u{0732}', '\u{0733}', '\u{0734}', '\u{0735}', '\u{0736}', '\u{0737}', '\u{0738}',
-  '\u{0739}', '\u{073A}', '\u{073B}', '\u{073C}', '\u{073D}', '\u{073E}', '\u{073F}', '\u{0740}',
-  '\u{0741}', '\u{0742}', '\u{0743}', '\u{0744}', '\u{0745}', '\u{0746}', '\u{0747}', '\u{0748}',
-  '\u{0749}', '\u{074A}', '\u{07EB}', '\u{07EC}', '\u{07ED}', '\u{07EE}', '\u{07EF}', '\u{07F0}',
-  '\u{07F1}', '\u{07F2}', '\u{07F3}', '\u{0816}', '\u{0817}', '\u{0818}', '\u{0819}', '\u{081B}',
-  '\u{081C}', '\u{081D}', '\u{081E}', '\u{081F}', '\u{0820}', '\u{0821}', '\u{0822}', '\u{0823}',
-  '\u{0825}', '\u{0826}', '\u{0827}', '\u{0829}', '\u{082A}', '\u{082B}', '\u{082C}', '\u{082D}',
-  '\u{0859}', '\u{085A}', '\u{085B}', '\u{08D4}', '\u{08D5}', '\u{08D6}', '\u{08D7}', '\u{08D8}',
-  '\u{08D9}', '\u{08DA}', '\u{08DB}', '\u{08DC}', '\u{08DD}', '\u{08DE}', '\u{08DF}', '\u{08E0}',
-  '\u{08E1}', '\u{08E3}', '\u{08E4}', '\u{08E5}', '\u{08E6}', '\u{08E7}', '\u{08E8}', '\u{08E9}',
-  '\u{08EA}', '\u{08EB}', '\u{08EC}', '\u{08ED}', '\u{08EE}', '\u{08EF}', '\u{08F0}', '\u{08F1}',
-  '\u{08F2}', '\u{08F3}', '\u{08F4}', '\u{08F5}', '\u{08F6}', '\u{08F7}', '\u{08F8}', '\u{08F9}',
-  '\u{08FA}', '\u{08FB}', '\u{08FC}', '\u{08FD}', '\u{08FE}', '\u{08FF}',
+  '\u{0305}',
+  '\u{030D}',
+  '\u{030E}',
+  '\u{0310}',
+  '\u{0312}',
+  '\u{033D}',
+  '\u{033E}',
+  '\u{033F}',
+  '\u{0346}',
+  '\u{034A}',
+  '\u{034B}',
+  '\u{034C}',
+  '\u{0350}',
+  '\u{0351}',
+  '\u{0352}',
+  '\u{0357}',
+  '\u{035B}',
+  '\u{0363}',
+  '\u{0364}',
+  '\u{0365}',
+  '\u{0366}',
+  '\u{0367}',
+  '\u{0368}',
+  '\u{0369}',
+  '\u{036A}',
+  '\u{036B}',
+  '\u{036C}',
+  '\u{036D}',
+  '\u{036E}',
+  '\u{036F}',
+  '\u{0483}',
+  '\u{0484}',
+  '\u{0485}',
+  '\u{0486}',
+  '\u{0487}',
+  '\u{0592}',
+  '\u{0593}',
+  '\u{0594}',
+  '\u{0595}',
+  '\u{0597}',
+  '\u{0598}',
+  '\u{0599}',
+  '\u{059C}',
+  '\u{059D}',
+  '\u{059E}',
+  '\u{059F}',
+  '\u{05A0}',
+  '\u{05A1}',
+  '\u{05A8}',
+  '\u{05A9}',
+  '\u{05AB}',
+  '\u{05AC}',
+  '\u{05AF}',
+  '\u{05C4}',
+  '\u{0610}',
+  '\u{0611}',
+  '\u{0612}',
+  '\u{0613}',
+  '\u{0614}',
+  '\u{0615}',
+  '\u{0616}',
+  '\u{0617}',
+  '\u{0657}',
+  '\u{0658}',
+  '\u{0659}',
+  '\u{065A}',
+  '\u{065B}',
+  '\u{065D}',
+  '\u{065E}',
+  '\u{06D6}',
+  '\u{06D7}',
+  '\u{06D8}',
+  '\u{06D9}',
+  '\u{06DA}',
+  '\u{06DB}',
+  '\u{06DC}',
+  '\u{06DF}',
+  '\u{06E0}',
+  '\u{06E1}',
+  '\u{06E2}',
+  '\u{06E4}',
+  '\u{06E7}',
+  '\u{06E8}',
+  '\u{06EB}',
+  '\u{06EC}',
+  '\u{0730}',
+  '\u{0732}',
+  '\u{0733}',
+  '\u{0735}',
+  '\u{0736}',
+  '\u{073A}',
+  '\u{073D}',
+  '\u{073F}',
+  '\u{0740}',
+  '\u{0741}',
+  '\u{0743}',
+  '\u{0745}',
+  '\u{0747}',
+  '\u{0749}',
+  '\u{074A}',
+  '\u{07EB}',
+  '\u{07EC}',
+  '\u{07ED}',
+  '\u{07EE}',
+  '\u{07EF}',
+  '\u{07F0}',
+  '\u{07F1}',
+  '\u{07F3}',
+  '\u{0816}',
+  '\u{0817}',
+  '\u{0818}',
+  '\u{0819}',
+  '\u{081B}',
+  '\u{081C}',
+  '\u{081D}',
+  '\u{081E}',
+  '\u{081F}',
+  '\u{0820}',
+  '\u{0821}',
+  '\u{0822}',
+  '\u{0823}',
+  '\u{0825}',
+  '\u{0826}',
+  '\u{0827}',
+  '\u{0829}',
+  '\u{082A}',
+  '\u{082B}',
+  '\u{082C}',
+  '\u{082D}',
+  '\u{0951}',
+  '\u{0953}',
+  '\u{0954}',
+  '\u{0F82}',
+  '\u{0F83}',
+  '\u{0F86}',
+  '\u{0F87}',
+  '\u{135D}',
+  '\u{135E}',
+  '\u{135F}',
+  '\u{17DD}',
+  '\u{193A}',
+  '\u{1A17}',
+  '\u{1A75}',
+  '\u{1A76}',
+  '\u{1A77}',
+  '\u{1A78}',
+  '\u{1A79}',
+  '\u{1A7A}',
+  '\u{1A7B}',
+  '\u{1A7C}',
+  '\u{1B6B}',
+  '\u{1B6D}',
+  '\u{1B6E}',
+  '\u{1B6F}',
+  '\u{1B70}',
+  '\u{1B71}',
+  '\u{1B72}',
+  '\u{1B73}',
+  '\u{1CD0}',
+  '\u{1CD1}',
+  '\u{1CD2}',
+  '\u{1CDA}',
+  '\u{1CDB}',
+  '\u{1CE0}',
+  '\u{1DC0}',
+  '\u{1DC1}',
+  '\u{1DC3}',
+  '\u{1DC4}',
+  '\u{1DC5}',
+  '\u{1DC6}',
+  '\u{1DC7}',
+  '\u{1DC8}',
+  '\u{1DC9}',
+  '\u{1DCB}',
+  '\u{1DCC}',
+  '\u{1DD1}',
+  '\u{1DD2}',
+  '\u{1DD3}',
+  '\u{1DD4}',
+  '\u{1DD5}',
+  '\u{1DD6}',
+  '\u{1DD7}',
+  '\u{1DD8}',
+  '\u{1DD9}',
+  '\u{1DDA}',
+  '\u{1DDB}',
+  '\u{1DDC}',
+  '\u{1DDD}',
+  '\u{1DDE}',
+  '\u{1DDF}',
+  '\u{1DE0}',
+  '\u{1DE1}',
+  '\u{1DE2}',
+  '\u{1DE3}',
+  '\u{1DE4}',
+  '\u{1DE5}',
+  '\u{1DE6}',
+  '\u{1DFE}',
+  '\u{20D0}',
+  '\u{20D1}',
+  '\u{20D4}',
+  '\u{20D5}',
+  '\u{20D6}',
+  '\u{20D7}',
+  '\u{20DB}',
+  '\u{20DC}',
+  '\u{20E1}',
+  '\u{20E7}',
+  '\u{20E9}',
+  '\u{20F0}',
+  '\u{2CEF}',
+  '\u{2CF0}',
+  '\u{2CF1}',
+  '\u{2DE0}',
+  '\u{2DE1}',
+  '\u{2DE2}',
+  '\u{2DE3}',
+  '\u{2DE4}',
+  '\u{2DE5}',
+  '\u{2DE6}',
+  '\u{2DE7}',
+  '\u{2DE8}',
+  '\u{2DE9}',
+  '\u{2DEA}',
+  '\u{2DEB}',
+  '\u{2DEC}',
+  '\u{2DED}',
+  '\u{2DEE}',
+  '\u{2DEF}',
+  '\u{2DF0}',
+  '\u{2DF1}',
+  '\u{2DF2}',
+  '\u{2DF3}',
+  '\u{2DF4}',
+  '\u{2DF5}',
+  '\u{2DF6}',
+  '\u{2DF7}',
+  '\u{2DF8}',
+  '\u{2DF9}',
+  '\u{2DFA}',
+  '\u{2DFB}',
+  '\u{2DFC}',
+  '\u{2DFD}',
+  '\u{2DFE}',
+  '\u{2DFF}',
+  '\u{A66F}',
+  '\u{A67C}',
+  '\u{A67D}',
+  '\u{A6F0}',
+  '\u{A6F1}',
+  '\u{A8E0}',
+  '\u{A8E1}',
+  '\u{A8E2}',
+  '\u{A8E3}',
+  '\u{A8E4}',
+  '\u{A8E5}',
+  '\u{A8E6}',
+  '\u{A8E7}',
+  '\u{A8E8}',
+  '\u{A8E9}',
+  '\u{A8EA}',
+  '\u{A8EB}',
+  '\u{A8EC}',
+  '\u{A8ED}',
+  '\u{A8EE}',
+  '\u{A8EF}',
+  '\u{A8F0}',
+  '\u{A8F1}',
+  '\u{AAB0}',
+  '\u{AAB2}',
+  '\u{AAB3}',
+  '\u{AAB7}',
+  '\u{AAB8}',
+  '\u{AABE}',
+  '\u{AABF}',
+  '\u{AAC1}',
+  '\u{FE20}',
+  '\u{FE21}',
+  '\u{FE22}',
+  '\u{FE23}',
+  '\u{FE24}',
+  '\u{FE25}',
+  '\u{FE26}',
+  '\u{10A0F}',
+  '\u{10A38}',
+  '\u{1D185}',
+  '\u{1D186}',
+  '\u{1D187}',
+  '\u{1D188}',
+  '\u{1D189}',
+  '\u{1D1AA}',
+  '\u{1D1AB}',
+  '\u{1D1AC}',
+  '\u{1D1AD}',
+  '\u{1D242}',
+  '\u{1D243}',
+  '\u{1D244}',
 ];
 
 fn kitty_placeholder_diacritic(index: u16) -> char {
@@ -998,6 +1435,146 @@ fn kitty_placeholder_diacritic(index: u16) -> char {
 mod tests {
   use super::*;
   use ratatui::style::{Color, Style};
+
+  fn kitty_unicode_overlay(area: Rect) -> ProtocolOverlay {
+    ProtocolOverlay {
+      area,
+      mode: RenderMode::Kitty,
+      data: "upload-and-place".to_string(),
+      refresh: Some("place".to_string()),
+      placement: Some(ProtocolPlacement::KittyUnicode {
+        image_id: 0x12_34_56,
+      }),
+      fingerprint: 1,
+      erase: Some("erase".to_string()),
+    }
+  }
+
+  #[test]
+  fn kitty_unicode_placeholder_preserves_wide_glyph_crossing_left_edge() {
+    let area = Rect::new(0, 0, 4, 1);
+    let mut buffer = Buffer::empty(area);
+    buffer.set_string(0, 0, "界", Style::default());
+    let previous = buffer.clone();
+
+    fill_kitty_unicode_placeholders(
+      &mut buffer,
+      &[kitty_unicode_overlay(Rect::new(1, 0, 2, 1))],
+      &[],
+    );
+
+    assert_eq!(buffer[(0, 0)].symbol(), "界");
+    assert_ne!(
+      buffer[(1, 0)].symbol().chars().next(),
+      Some(KITTY_PLACEHOLDER)
+    );
+    assert_eq!(
+      buffer[(2, 0)].symbol().chars().next(),
+      Some(KITTY_PLACEHOLDER)
+    );
+    assert_eq!(
+      previous
+        .diff(&buffer)
+        .into_iter()
+        .map(|(x, _, _)| x)
+        .collect::<Vec<_>>(),
+      vec![2]
+    );
+  }
+
+  #[test]
+  fn kitty_unicode_occluder_cells_use_regular_diff_without_placeholders() {
+    let area = Rect::new(0, 0, 3, 1);
+    let mut buffer = Buffer::with_lines(["pop"]);
+
+    fill_kitty_unicode_placeholders(
+      &mut buffer,
+      &[kitty_unicode_overlay(area)],
+      &[Rect::new(1, 0, 1, 1)],
+    );
+
+    assert_eq!(buffer[(1, 0)].symbol(), "o");
+    assert!(matches!(buffer[(1, 0)].diff_option, CellDiffOption::None));
+    assert_eq!(
+      buffer[(0, 0)].symbol().chars().next(),
+      Some(KITTY_PLACEHOLDER)
+    );
+    assert_eq!(
+      buffer[(2, 0)].symbol().chars().next(),
+      Some(KITTY_PLACEHOLDER)
+    );
+  }
+
+  #[test]
+  fn occluder_clips_underlying_wide_glyph_without_an_image() {
+    let area = Rect::new(0, 0, 4, 1);
+    let mut buffer = Buffer::empty(area);
+    buffer.set_string(0, 0, "界", Style::default());
+    buffer[(1, 0)].set_symbol("│");
+
+    clip_wide_glyphs_crossing_occluder_left_edges(&mut buffer, &[Rect::new(1, 0, 3, 1)]);
+
+    assert_eq!(buffer[(0, 0)].symbol(), " ");
+    assert_eq!(buffer[(1, 0)].symbol(), "│");
+    assert!(matches!(buffer[(0, 0)].diff_option, CellDiffOption::None));
+  }
+
+  #[test]
+  fn kitty_unicode_occluder_preserves_wide_glyph_continuation() {
+    let area = Rect::new(0, 0, 4, 1);
+    let mut buffer = Buffer::empty(area);
+    buffer.set_string(1, 0, "界", Style::default());
+
+    fill_kitty_unicode_placeholders(
+      &mut buffer,
+      &[kitty_unicode_overlay(area)],
+      &[Rect::new(1, 0, 1, 1)],
+    );
+
+    assert_eq!(buffer[(1, 0)].symbol(), "界");
+    assert_ne!(
+      buffer[(2, 0)].symbol().chars().next(),
+      Some(KITTY_PLACEHOLDER)
+    );
+    assert_eq!(
+      buffer[(3, 0)].symbol().chars().next(),
+      Some(KITTY_PLACEHOLDER)
+    );
+  }
+
+  #[test]
+  fn unchanged_kitty_unicode_placeholders_produce_no_text_diff() {
+    let area = Rect::new(0, 0, 3, 1);
+    let mut previous = Buffer::empty(area);
+    let mut current = Buffer::empty(area);
+    let overlays = [kitty_unicode_overlay(area)];
+    fill_kitty_unicode_placeholders(&mut previous, &overlays, &[]);
+    fill_kitty_unicode_placeholders(&mut current, &overlays, &[]);
+
+    assert!(previous.diff(&current).is_empty());
+  }
+
+  #[test]
+  fn kitty_unicode_placeholder_encodes_full_image_id() {
+    assert_eq!(KITTY_DIACRITICS.len(), 297);
+    let area = Rect::new(0, 0, 1, 1);
+    let mut buffer = Buffer::empty(area);
+    let mut overlay = kitty_unicode_overlay(area);
+    overlay.placement = Some(ProtocolPlacement::KittyUnicode {
+      image_id: 0xab_12_34_56,
+    });
+
+    fill_kitty_unicode_placeholders(&mut buffer, &[overlay], &[]);
+
+    let chars = buffer[(0, 0)].symbol().chars().collect::<Vec<_>>();
+    assert_eq!(chars[0], KITTY_PLACEHOLDER);
+    assert_eq!(chars[1], kitty_placeholder_diacritic(0));
+    assert_eq!(chars[2], kitty_placeholder_diacritic(0));
+    assert_eq!(chars[3], kitty_placeholder_diacritic(0xab));
+    assert_eq!(buffer[(0, 0)].fg, Color::Rgb(0x12, 0x34, 0x56));
+    assert_eq!(buffer[(0, 0)].underline_color, Color::Reset);
+    assert!(matches!(buffer[(0, 0)].diff_option, CellDiffOption::None));
+  }
 
   #[test]
   fn kitty_placement_update_preclears_replaced_area() {
@@ -1169,6 +1746,53 @@ mod tests {
 
     assert!(output.contains("place-only"));
     assert!(!output.contains("upload-and-place"));
+  }
+
+  #[test]
+  fn moving_same_kitty_unicode_image_writes_no_protocol_data() {
+    let mut renderer = ProtocolOverlayRenderer {
+      state: vec![ProtocolOverlayState {
+        area: Rect::new(0, 0, 80, 20),
+        mode: RenderMode::Kitty,
+        placement: Some(ProtocolPlacement::KittyUnicode { image_id: 7 }),
+        fingerprint: 1,
+        erase: Some("erase".to_string()),
+      }],
+    };
+    let overlays = vec![ProtocolOverlay {
+      area: Rect::new(0, 1, 80, 20),
+      mode: RenderMode::Kitty,
+      data: "upload-and-place".to_string(),
+      refresh: Some("virtual-place".to_string()),
+      placement: Some(ProtocolPlacement::KittyUnicode { image_id: 7 }),
+      fingerprint: 1,
+      erase: Some("erase".to_string()),
+    }];
+
+    let mut output = Vec::new();
+    let commit = renderer.begin(&mut output, &overlays).unwrap();
+    renderer.finish(&mut output, commit).unwrap();
+
+    assert!(output.is_empty());
+    assert_eq!(renderer.state[0].area, Rect::new(0, 1, 80, 20));
+  }
+
+  #[test]
+  fn new_kitty_unicode_image_is_written_during_begin() {
+    let mut renderer = ProtocolOverlayRenderer::default();
+    let overlays = vec![kitty_unicode_overlay(Rect::new(0, 0, 3, 1))];
+
+    let mut begin_output = Vec::new();
+    let commit = renderer.begin(&mut begin_output, &overlays).unwrap();
+
+    assert!(String::from_utf8_lossy(&begin_output).contains("upload-and-place"));
+    assert!(commit.clear_areas().is_empty());
+    assert!(commit.writes[0].clear_areas.is_empty());
+    assert!(commit.writes[0].prewritten);
+
+    let mut finish_output = Vec::new();
+    renderer.finish(&mut finish_output, commit).unwrap();
+    assert!(finish_output.is_empty());
   }
 
   #[test]
@@ -1475,7 +2099,10 @@ mod tests {
       sixel_buffer[(0, 0)].diff_option,
       CellDiffOption::AlwaysUpdate
     ));
-    assert!(matches!(sixel_buffer[(1, 0)].diff_option, CellDiffOption::Skip));
+    assert!(matches!(
+      sixel_buffer[(1, 0)].diff_option,
+      CellDiffOption::Skip
+    ));
 
     // Kitty composites above text, so the flushed cells cannot damage the
     // image and no re-placement is needed.
