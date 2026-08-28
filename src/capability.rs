@@ -217,6 +217,9 @@ impl TerminalCapability {
   pub fn preferred_render_modes(&self, zellij_sixel: &str) -> Vec<RenderMode> {
     let mut modes = Vec::new();
     if self.multiplexer.as_deref() == Some("zellij") {
+      if self.pixel_protocols.contains(&PixelProtocol::Kitty) {
+        modes.push(RenderMode::Kitty);
+      }
       let allow_sixel = match zellij_sixel.trim().to_ascii_lowercase().as_str() {
         "on" | "true" | "yes" => self.pixel_protocols.contains(&PixelProtocol::Sixel),
         "auto" => self.probe.sixel && self.pixel_protocols.contains(&PixelProtocol::Sixel),
@@ -275,7 +278,8 @@ impl TerminalCapability {
   }
 
   pub fn kitty_unicode_placeholders(&self) -> bool {
-    matches!(self.brand.as_deref(), Some("kitty" | "ghostty" | "rio"))
+    self.multiplexer.as_deref() != Some("zellij")
+      && matches!(self.brand.as_deref(), Some("kitty" | "ghostty" | "rio"))
   }
 }
 
@@ -295,12 +299,16 @@ pub fn detect() -> TerminalCapability {
   let term = mux_term.or(env_term);
   let term_program = mux_term_program.or(env_term_program);
   let env_brand = detect_brand_from_env(term.as_deref(), term_program.as_deref());
-  let needs_identity_probe = env_brand.is_none() && multiplexer.as_deref() != Some("zellij");
+  let in_zellij = multiplexer.as_deref() == Some("zellij");
+  let needs_identity_probe = env_brand.is_none() && !in_zellij;
   let requests = ProbeRequests {
-    kitty_graphics: needs_identity_probe,
+    // Zellij 0.45+ implements KGP and answers the standard query only when
+    // both its KGP support and the attached host terminal support are active.
+    // Do not trust outer-terminal environment variables inside the mux.
+    kitty_graphics: in_zellij || needs_identity_probe,
     terminal_version: needs_identity_probe,
     cell_pixels: true,
-    da1: env_brand.is_none() || multiplexer.as_deref() == Some("zellij"),
+    da1: env_brand.is_none() || in_zellij,
   };
   let mut active_probe = probe_terminal(multiplexer.as_deref(), requests);
   if active_probe.summary.cell_pixels.is_none() {
@@ -333,9 +341,11 @@ pub fn detect() -> TerminalCapability {
   }
   add_environment_protocol_hints(&mut pixel_protocols, &term_lower, &program_lower);
 
-  if multiplexer.as_deref() == Some("zellij") {
-    pixel_protocols.retain(|protocol| *protocol == PixelProtocol::Sixel);
-  }
+  constrain_multiplexer_protocols(
+    &mut pixel_protocols,
+    multiplexer.as_deref(),
+    &active_probe.summary,
+  );
 
   let color_level = if colorterm_lower.contains("truecolor")
     || colorterm_lower.contains("24bit")
@@ -363,6 +373,24 @@ pub fn detect() -> TerminalCapability {
     color_level,
     cell_pixels,
   }
+}
+
+fn constrain_multiplexer_protocols(
+  protocols: &mut Vec<PixelProtocol>,
+  multiplexer: Option<&str>,
+  probe: &TerminalProbe,
+) {
+  if multiplexer != Some("zellij") {
+    return;
+  }
+
+  // Zellij exposes the outer terminal's environment to panes. Those hints do
+  // not prove that the corresponding protocol is enabled in Zellij itself.
+  protocols.retain(|protocol| match protocol {
+    PixelProtocol::Kitty => probe.kitty_graphics,
+    PixelProtocol::Sixel => probe.sixel,
+    PixelProtocol::Iterm2 => false,
+  });
 }
 
 fn tmux_term_program() -> (Option<String>, Option<String>) {
@@ -846,5 +874,94 @@ fn detect_multiplexer() -> Option<String> {
     Some("screen".to_string())
   } else {
     None
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{
+    ColorLevel, PixelProtocol, RenderMode, TerminalCapability, TerminalProbe,
+    constrain_multiplexer_protocols,
+  };
+
+  fn zellij_capability(
+    kitty_graphics: bool,
+    sixel: bool,
+    pixel_protocols: Vec<PixelProtocol>,
+  ) -> TerminalCapability {
+    TerminalCapability {
+      term: Some("xterm-kitty".to_string()),
+      term_program: None,
+      colorterm: Some("truecolor".to_string()),
+      multiplexer: Some("zellij".to_string()),
+      brand: Some("kitty".to_string()),
+      probe: TerminalProbe {
+        attempted: true,
+        response_bytes: 32,
+        kitty_graphics,
+        sixel,
+        cell_pixels: Some((10, 20)),
+        brand: None,
+        error: None,
+      },
+      pixel_protocols,
+      color_level: ColorLevel::TrueColor,
+      cell_pixels: Some((10, 20)),
+    }
+  }
+
+  #[test]
+  fn zellij_prefers_probed_kitty_graphics() {
+    let capability =
+      zellij_capability(true, true, vec![PixelProtocol::Kitty, PixelProtocol::Sixel]);
+
+    assert_eq!(
+      capability.preferred_render_modes("off"),
+      vec![RenderMode::Kitty, RenderMode::Symbols, RenderMode::Ascii]
+    );
+    assert_eq!(
+      capability.preferred_render_modes("auto"),
+      vec![
+        RenderMode::Kitty,
+        RenderMode::Sixel,
+        RenderMode::Symbols,
+        RenderMode::Ascii,
+      ]
+    );
+  }
+
+  #[test]
+  fn zellij_ignores_unprobed_outer_terminal_hints() {
+    let probe = zellij_capability(false, false, Vec::new()).probe;
+    let mut protocols = vec![
+      PixelProtocol::Kitty,
+      PixelProtocol::Sixel,
+      PixelProtocol::Iterm2,
+    ];
+
+    constrain_multiplexer_protocols(&mut protocols, Some("zellij"), &probe);
+
+    assert!(protocols.is_empty());
+  }
+
+  #[test]
+  fn zellij_keeps_protocols_confirmed_by_its_probe() {
+    let probe = zellij_capability(true, true, Vec::new()).probe;
+    let mut protocols = vec![
+      PixelProtocol::Kitty,
+      PixelProtocol::Sixel,
+      PixelProtocol::Iterm2,
+    ];
+
+    constrain_multiplexer_protocols(&mut protocols, Some("zellij"), &probe);
+
+    assert_eq!(protocols, vec![PixelProtocol::Kitty, PixelProtocol::Sixel]);
+  }
+
+  #[test]
+  fn zellij_disables_unsupported_unicode_placeholders() {
+    let capability = zellij_capability(true, false, vec![PixelProtocol::Kitty]);
+
+    assert!(!capability.kitty_unicode_placeholders());
   }
 }
