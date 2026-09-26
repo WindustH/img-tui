@@ -1,10 +1,20 @@
-//! Reusable terminal image rendering primitives for ratatui applications.
+//! Terminal image rendering for ratatui applications.
 //!
-//! `ProtocolFrameRenderer` is the normal integration point: it wraps a ratatui
-//! frame in a protocol image transaction, forcing text cells under removed
-//! images to be redrawn, writing new image protocol payloads before ratatui
-//! flushes the frame, and clearing stale image areas only after replacement
-//! overlays have been queued. This avoids exposing blank intermediate frames.
+//! - [`capability`] detects which image protocols the terminal supports
+//!   (kitty graphics, sixel, iTerm2 inline images), including inside tmux and
+//!   Zellij, and suggests [`RenderMode`]s to try.
+//! - [`native_image`] decodes and scales images and encodes them as protocol
+//!   escape sequences.
+//! - [`display`] draws ratatui frames together with those images.
+//!
+//! [`ProtocolFrameRenderer`] is the normal integration point. Its
+//! [`draw`](ProtocolFrameRenderer::draw) renders a frame and returns a list of
+//! [`ProtocolOverlay`]s; the renderer uploads new kitty placeholder images
+//! before the frame's text is flushed, writes the other image payloads right
+//! after it (text cells under replaced or removed images are redrawn in the
+//! same flush), and erases images that are gone only once their replacements
+//! have been written. Unchanged images are not rewritten, so frames never
+//! show a blank intermediate state.
 
 pub mod capability;
 pub mod display;
