@@ -2,6 +2,7 @@
 //! of what was last flushed beneath each image.
 
 use ratatui::{
+  Frame,
   buffer::{Buffer, Cell, CellDiffOption},
   layout::Rect,
 };
@@ -23,6 +24,13 @@ pub fn skip_protocol_areas(buffer: &mut Buffer, areas: impl IntoIterator<Item = 
   for area in areas {
     set_diff_option(buffer, area, CellDiffOption::Skip);
   }
+}
+
+/// Keep the frame's text from being drawn over the protocol image at `area`
+/// ([`skip_protocol_areas`] for one area). Call it for each overlay while
+/// drawing the frame.
+pub fn reserve_protocol_area(frame: &mut Frame, area: Rect) {
+  skip_protocol_areas(frame.buffer_mut(), [area]);
 }
 
 fn set_diff_option(buffer: &mut Buffer, area: Rect, option: CellDiffOption) {
@@ -122,7 +130,7 @@ pub(super) fn flush_stale_overlay_cells(
     // U=1 placeholders live in the text buffer; there is no post-flush
     // damage to repair.
     if matches!(
-      &overlay.placement,
+      overlay.image.placement,
       Some(ProtocolPlacement::KittyUnicode { .. })
     ) {
       continue;
@@ -143,7 +151,7 @@ pub(super) fn flush_stale_overlay_cells(
         changed = true;
       }
     }
-    if changed && overlay.mode != RenderMode::Kitty {
+    if changed && overlay.image.mode != RenderMode::Kitty {
       repaint.push(index);
     }
   }
@@ -155,6 +163,7 @@ mod tests {
   use ratatui::style::{Color, Style};
 
   use super::*;
+  use crate::display::test_overlay;
 
   #[test]
   fn stale_cells_under_unchanged_overlay_are_flushed() {
@@ -172,15 +181,7 @@ mod tests {
     desired[(1, 0)].set_symbol("b");
     skip_protocol_areas(&mut desired, [area]);
 
-    let overlay = |mode: RenderMode| ProtocolOverlay {
-      area,
-      mode,
-      data: "payload".to_string(),
-      refresh: None,
-      placement: None,
-      fingerprint: 7,
-      erase: None,
-    };
+    let overlay = |mode: RenderMode| test_overlay(area, mode, "payload", 7);
 
     let mut sixel_buffer = desired.clone();
     let repaint =
@@ -213,15 +214,7 @@ mod tests {
     let mut buffer = Buffer::empty(area);
     buffer[(0, 0)].set_style(Style::default().bg(Color::Red));
     skip_protocol_areas(&mut buffer, [area]);
-    let overlay = ProtocolOverlay {
-      area,
-      mode: RenderMode::Iterm2,
-      data: "payload".to_string(),
-      refresh: None,
-      placement: None,
-      fingerprint: 1,
-      erase: None,
-    };
+    let overlay = test_overlay(area, RenderMode::Iterm2, "payload", 1);
 
     let repaint = flush_stale_overlay_cells(&mut buffer, &[overlay], &[]);
     assert!(repaint.is_empty());

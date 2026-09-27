@@ -27,6 +27,10 @@ It powers the image views of pdf-tui, gallery-tui and music-tui.
   through Unicode placeholders, so dialogs can cover part of an image. Sixel
   images use a 256-color palette with compact run-length output and keep
   transparent areas transparent. iTerm2 images are sent as PNG or JPEG.
+- **Encode once, draw every frame for free.** An encoded image is shared,
+  not copied, each time a frame shows it, and its bytes can be cached (in
+  memory or on disk) and turned back into an image later without
+  re-encoding.
 - **No flicker, no leftovers.** Each frame writes only the images that
   changed, erases the ones that went away only after their replacements are
   on screen, keeps the text under images in step (hover highlights,
@@ -59,62 +63,46 @@ let config = NativeImageConfig {
 };
 ```
 
-Render an image for a `width` x `height` cell area as a `ProtocolOverlay`.
-The functions are async and run their heavy work on Tokio's blocking pool.
-For sixel and iTerm2:
+Prepare an image for a `width` x `height` cell area and encode it for the
+chosen mode. The functions are async and run their heavy work on Tokio's
+blocking pool:
 
 ```rust
-use img_tui::{ProtocolOverlay, native_image};
+use img_tui::{ProtocolImage, ProtocolImageSpec, native_image};
 
 let prepared = native_image::prepare(&path, width, height, config.cell_pixels).await?;
-let data = native_image::render_prepared(&prepared, mode, &config, None).await?;
-let overlay = ProtocolOverlay {
-  area,        // where the image goes in the frame
-  mode,
-  data: String::from_utf8(data)?,
-  refresh: None,
-  placement: None,
-  fingerprint, // any value that changes when the image changes
-  erase: None,
+let spec = ProtocolImageSpec {
+  // Kitty only: the id the terminal knows the image by, stable per image,
+  // and a placement that lets the image move without being sent again.
+  image_id: Some(native_image::kitty_image_id(key.as_bytes())),
+  placement_id: Some(1),
+  ..ProtocolImageSpec::new(mode, width, height)
 };
+let image = ProtocolImage::render(&prepared, &spec, &config).await?;
 ```
 
-For kitty, upload the image once and describe how to show it, so that moving
-it later only needs the light `refresh` sequence. With Unicode placeholders
-(`config.kitty_unicode_placeholders`):
+Kitty images are shown through Unicode placeholders when
+`config.kitty_unicode_placeholders` is set; sixel and iTerm2 ignore the ids.
+To cache the encoded bytes, split `render` in two:
 
 ```rust
-use img_tui::ProtocolPlacement;
-
-let image_id = native_image::kitty_image_id(key.as_bytes()); // stable per image key
-let upload = native_image::render_prepared_kitty_upload(&prepared, &config, image_id).await?;
-let place = native_image::render_kitty_virtual_placement(&config, image_id, width, height);
-let overlay = ProtocolOverlay {
-  area,
-  mode: RenderMode::Kitty,
-  data: String::from_utf8([upload.data, place.clone()].concat())?,
-  refresh: Some(String::from_utf8(place)?),
-  placement: Some(ProtocolPlacement::KittyUnicode { image_id }),
-  fingerprint,
-  erase: native_image::erase_sequence(RenderMode::Kitty, config.passthrough.as_deref(), Some(image_id)),
-};
+let encoded = native_image::encode_protocol(&prepared, &spec, &config).await?;
+// ... store encoded.data and encoded.refresh, read them back later ...
+let image = ProtocolImage::from_encoded(encoded, &spec, &config)?;
 ```
 
-Without placeholders, use `render_kitty_viewport_from_upload` for `refresh`,
-`ProtocolPlacement::KittyPlacement` and `erase_kitty_placement_sequence`
-instead; the upload alone goes in `data`.
-
-Draw every frame through a `ProtocolFrameRenderer`, reserving the image areas
-so ratatui does not paint over them:
+Draw every frame through a `ProtocolFrameRenderer`, reserving the image
+areas so ratatui does not paint over them. Keep the `ProtocolImage` around:
+placing it in a frame does not copy it.
 
 ```rust
-use img_tui::{ProtocolFrameOutput, ProtocolFrameRenderer, display::skip_protocol_areas};
+use img_tui::{ProtocolFrameOutput, ProtocolFrameRenderer, reserve_protocol_area};
 
 let mut renderer = ProtocolFrameRenderer::default();
 renderer.draw(&mut terminal, |frame| {
   // ... draw widgets ...
-  skip_protocol_areas(frame.buffer_mut(), [overlay.area]);
-  ProtocolFrameOutput::new(vec![overlay.clone()], None)
+  reserve_protocol_area(frame, area);
+  ProtocolFrameOutput::new(vec![image.overlay(area)], None)
 })?;
 
 // Before suspending or exiting: remove the images.

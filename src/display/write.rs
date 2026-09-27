@@ -72,18 +72,19 @@ pub(super) fn write_protocol_overlay(
   // cells. When the same image moves, the regular terminal diff relocates
   // those cells; creating another virtual placement would be redundant and
   // can leave multiple placements competing for the same image id.
+  let image = &overlay.image;
   if refresh
     && matches!(
-      overlay.placement,
+      image.placement,
       Some(ProtocolPlacement::KittyUnicode { .. })
     )
   {
     return Ok(());
   }
   if matches!(
-    overlay.placement,
+    image.placement,
     Some(ProtocolPlacement::KittyPlacement { .. })
-  ) && overlay.refresh.is_some()
+  ) && image.refresh.is_some()
   {
     return write_kitty_placement_overlay(writer, overlay, refresh);
   }
@@ -91,9 +92,9 @@ pub(super) fn write_protocol_overlay(
   // content through the terminal diff (see ProtocolFrameRenderer::draw);
   // writing plain spaces here would clobber the styled cells.
   let data = if refresh {
-    overlay.refresh.as_deref().unwrap_or(&overlay.data)
+    image.refresh.as_deref().unwrap_or(&image.data)
   } else {
-    &overlay.data
+    &image.data
   };
   let tmux_passthrough = is_tmux_passthrough(data);
   queue!(writer, SavePosition)?;
@@ -111,14 +112,14 @@ fn write_kitty_placement_overlay(
   overlay: &ProtocolOverlay,
   refresh: bool,
 ) -> Result<()> {
-  let Some(placement) = overlay.refresh.as_deref() else {
+  let Some(placement) = overlay.image.refresh.as_deref() else {
     return Ok(());
   };
   let tmux_passthrough = is_tmux_passthrough(placement);
 
   queue!(writer, SavePosition)?;
   if !refresh {
-    writer.write_all(overlay.data.as_bytes())?;
+    writer.write_all(overlay.image.data.as_bytes())?;
   }
   move_to_protocol_area(writer, overlay.area, tmux_passthrough)?;
   writer.write_all(placement.as_bytes())?;

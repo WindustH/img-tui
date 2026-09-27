@@ -7,6 +7,14 @@
 //!   escape sequences.
 //! - [`display`] draws ratatui frames together with those images.
 //!
+//! An image is prepared once for the cell area it fills
+//! ([`native_image::prepare`]) and encoded into a [`ProtocolImage`]
+//! ([`ProtocolImage::render`], or [`native_image::encode_protocol`] and
+//! [`ProtocolImage::from_encoded`] when the encoded bytes are cached).
+//! A `ProtocolImage` does not depend on where it is shown and is cheap to
+//! clone; each frame places it with [`ProtocolImage::overlay`] after
+//! reserving its cells with [`reserve_protocol_area`].
+//!
 //! [`ProtocolFrameRenderer`] is the normal integration point. Its
 //! [`draw`](ProtocolFrameRenderer::draw) renders a frame and returns a list of
 //! [`ProtocolOverlay`]s; the renderer uploads new kitty placeholder images
@@ -27,10 +35,10 @@ pub use capability::{
 };
 pub use display::{
   ProtocolFrameOutput, ProtocolFrameRenderer, ProtocolOverlayCommit, ProtocolOverlayRenderer,
-  force_update_areas, reset_protocol_images,
+  force_update_areas, reserve_protocol_area, reset_protocol_images,
 };
 pub use native_image::{
-  NativeImageConfig, NativeImageViewport, PreparedNativeImage, erase_kitty_placement_sequence,
-  erase_sequence,
+  EncodedProtocolImage, NativeImageConfig, NativeImageViewport, PreparedNativeImage,
+  ProtocolImageSpec, erase_kitty_placement_sequence, erase_sequence,
 };
-pub use protocol::{ProtocolOverlay, ProtocolPlacement};
+pub use protocol::{ProtocolImage, ProtocolOverlay, ProtocolPlacement};
