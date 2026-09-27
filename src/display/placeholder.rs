@@ -31,7 +31,7 @@ pub(super) fn fill_kitty_unicode_placeholders(
   let mut symbol = String::with_capacity(16);
   let mut text_owned = Vec::new();
   for overlay in overlays {
-    let Some(ProtocolPlacement::KittyUnicode { image_id }) = overlay.placement else {
+    let Some(ProtocolPlacement::KittyUnicode { image_id }) = overlay.image.placement else {
       continue;
     };
     let area = overlay.area;
@@ -470,20 +470,20 @@ mod tests {
   use ratatui::style::{Color, Style};
 
   use super::*;
-  use crate::RenderMode;
+  use crate::{ProtocolImage, RenderMode};
 
   fn kitty_unicode_overlay(area: Rect) -> ProtocolOverlay {
-    ProtocolOverlay {
-      area,
+    ProtocolImage {
       mode: RenderMode::Kitty,
-      data: "upload-and-place".to_string(),
-      refresh: Some("place".to_string()),
+      data: "upload-and-place".into(),
+      refresh: Some("place".into()),
       placement: Some(ProtocolPlacement::KittyUnicode {
         image_id: 0x12_34_56,
       }),
       fingerprint: 1,
-      erase: Some("erase".to_string()),
+      erase: Some("erase".into()),
     }
+    .overlay(area)
   }
 
   fn is_placeholder(buffer: &Buffer, x: u16, y: u16) -> bool {
@@ -600,7 +600,7 @@ mod tests {
     let area = Rect::new(0, 0, 1, 1);
     let mut buffer = Buffer::empty(area);
     let mut overlay = kitty_unicode_overlay(area);
-    overlay.placement = Some(ProtocolPlacement::KittyUnicode {
+    overlay.image.placement = Some(ProtocolPlacement::KittyUnicode {
       image_id: 0xab_12_34_56,
     });
 

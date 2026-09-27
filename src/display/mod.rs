@@ -25,7 +25,7 @@ use self::{
   write::{queue_cursor_state, write_protocol_overlay, write_protocol_writes},
 };
 pub use self::{
-  cells::{force_update_areas, skip_protocol_areas},
+  cells::{force_update_areas, reserve_protocol_area, skip_protocol_areas},
   overlay::{ProtocolOverlayCommit, ProtocolOverlayRenderer},
   write::reset_protocol_images,
 };
@@ -244,6 +244,25 @@ impl ProtocolFrameOutput {
   }
 }
 
+/// An overlay of a `mode` image drawn by `data`, for tests.
+#[cfg(test)]
+pub(crate) fn test_overlay(
+  area: Rect,
+  mode: crate::RenderMode,
+  data: &str,
+  fingerprint: u64,
+) -> ProtocolOverlay {
+  crate::ProtocolImage {
+    mode,
+    data: data.into(),
+    refresh: None,
+    placement: None,
+    fingerprint,
+    erase: None,
+  }
+  .overlay(area)
+}
+
 #[cfg(test)]
 mod tests {
   use std::io;
@@ -256,7 +275,7 @@ mod tests {
   };
 
   use super::*;
-  use crate::{ProtocolPlacement, RenderMode};
+  use crate::{ProtocolImage, ProtocolPlacement, RenderMode};
 
   /// Test backend that also records the raw bytes written through `Write`.
   struct RecordingBackend {
@@ -360,15 +379,25 @@ mod tests {
   }
 
   fn overlay(area: Rect, data: &str, fingerprint: u64) -> ProtocolOverlay {
-    ProtocolOverlay {
-      area,
-      mode: RenderMode::Sixel,
-      data: data.to_string(),
-      refresh: None,
-      placement: None,
+    test_overlay(area, RenderMode::Sixel, data, fingerprint)
+  }
+
+  /// A kitty overlay showing `data` through `placement`.
+  fn kitty_overlay(
+    area: Rect,
+    (data, refresh, erase): (&str, &str, &str),
+    placement: ProtocolPlacement,
+    fingerprint: u64,
+  ) -> ProtocolOverlay {
+    ProtocolImage {
+      mode: RenderMode::Kitty,
+      data: data.into(),
+      refresh: Some(refresh.into()),
+      placement: Some(placement),
       fingerprint,
-      erase: None,
+      erase: Some(erase.into()),
     }
+    .overlay(area)
   }
 
   /// A frame that draws `text` under the overlays' areas and reserves them,
@@ -383,10 +412,10 @@ mod tests {
           .buffer_mut()
           .set_string(overlay.area.x, overlay.area.y, text, Style::default());
         if !matches!(
-          overlay.placement,
+          overlay.image.placement,
           Some(ProtocolPlacement::KittyUnicode { .. })
         ) {
-          skip_protocol_areas(frame.buffer_mut(), [overlay.area]);
+          reserve_protocol_area(frame, overlay.area);
         }
       }
       ProtocolFrameOutput::new(overlays, None)
@@ -398,16 +427,15 @@ mod tests {
     let mut terminal = Terminal::new(RecordingBackend::new(20, 8)).unwrap();
     let mut renderer = ProtocolFrameRenderer::default();
     let area = Rect::new(1, 1, 4, 2);
-    let placement = ProtocolOverlay {
-      mode: RenderMode::Kitty,
-      refresh: Some("PLACE-K".to_string()),
-      placement: Some(ProtocolPlacement::KittyPlacement {
+    let placement = kitty_overlay(
+      Rect::new(10, 1, 4, 2),
+      ("UPLOAD-K", "PLACE-K", "ERASE-K"),
+      ProtocolPlacement::KittyPlacement {
         image_id: 7,
         placement_id: 3,
-      }),
-      erase: Some("ERASE-K".to_string()),
-      ..overlay(Rect::new(10, 1, 4, 2), "UPLOAD-K", 2)
-    };
+      },
+      2,
+    );
     let overlays = vec![overlay(area, "SIXEL-A", 1), placement];
 
     renderer
@@ -444,13 +472,12 @@ mod tests {
   fn resize_keeps_placeholder_images_without_reupload() {
     let mut terminal = Terminal::new(RecordingBackend::new(20, 8)).unwrap();
     let mut renderer = ProtocolFrameRenderer::default();
-    let unicode = ProtocolOverlay {
-      mode: RenderMode::Kitty,
-      refresh: Some("VIRTUAL".to_string()),
-      placement: Some(ProtocolPlacement::KittyUnicode { image_id: 9 }),
-      erase: Some("ERASE-U".to_string()),
-      ..overlay(Rect::new(2, 2, 3, 2), "UPLOAD-U", 1)
-    };
+    let unicode = kitty_overlay(
+      Rect::new(2, 2, 3, 2),
+      ("UPLOAD-U", "VIRTUAL", "ERASE-U"),
+      ProtocolPlacement::KittyUnicode { image_id: 9 },
+      1,
+    );
 
     renderer
       .draw(&mut terminal, frame(vec![unicode.clone()], ""))

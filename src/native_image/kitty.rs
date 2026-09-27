@@ -68,21 +68,17 @@ pub fn kitty_image_id(key: &[u8]) -> u32 {
 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum KittyTransmit {
-  /// Transmit and display at the cursor (`a=T`).
-  Display { unicode_placeholders: bool },
-  /// Transmit only (`a=t`); place later with [`placement`].
+  /// Transmit and display at the cursor, below text (`a=T`).
+  Display,
+  /// Transmit only (`a=t`); place later with [`placement`] or
+  /// [`virtual_placement`].
   UploadOnly,
 }
 
 impl KittyTransmit {
   fn control(self) -> &'static str {
     match self {
-      Self::Display {
-        unicode_placeholders: true,
-      } => "a=T,C=1,U=1",
-      Self::Display {
-        unicode_placeholders: false,
-      } => "a=T,z=-1,C=1",
+      Self::Display => "a=T,z=-1,C=1",
       Self::UploadOnly => "a=t",
     }
   }

@@ -2,11 +2,15 @@
 //! protocols.
 //!
 //! [`prepare`] decodes an image file, converts it to 8-bit sRGB and scales it
-//! to fit a cell area. The `render_*` functions turn a [`PreparedNativeImage`]
-//! into protocol escape sequences, wrapped for tmux or screen passthrough when
+//! to fit a cell area. [`encode_protocol`] turns a [`PreparedNativeImage`]
+//! into the escape sequences of a [`ProtocolImage`](crate::ProtocolImage) for
+//! any protocol, choosing how kitty images are uploaded and placed; the
+//! `render_*` functions are the lower-level building blocks it uses.
+//! Sequences are wrapped for tmux or screen passthrough when
 //! [`NativeImageConfig::passthrough`] says so. CPU-heavy work runs on Tokio's
 //! blocking thread pool.
 
+mod encode;
 mod envelope;
 mod iterm;
 mod kitty;
@@ -19,8 +23,10 @@ use std::{path::Path, sync::Arc};
 use anyhow::{Result, bail};
 use image::{DynamicImage, ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
 
-pub use self::kitty::{
-  KittyImageUpload, erase_kitty_placement_sequence, erase_sequence, kitty_image_id,
+pub(crate) use self::encode::KittyShow;
+pub use self::{
+  encode::{EncodedProtocolImage, ProtocolImageSpec, encode_protocol},
+  kitty::{KittyImageUpload, erase_kitty_placement_sequence, erase_sequence, kitty_image_id},
 };
 use self::{envelope::ProtocolEnvelope, kitty::KittyTransmit};
 use crate::RenderMode;
@@ -116,9 +122,11 @@ pub async fn prepare(
 
 /// Escape sequences that display `prepared` at the cursor.
 ///
-/// Kitty images are transmitted and displayed in one command (as a virtual
-/// placement when `kitty_unicode_placeholders` is set); `image_id` defaults
-/// to 1. Text modes are rejected.
+/// Kitty images are transmitted and displayed in one command; `image_id`
+/// defaults to 1. `kitty_unicode_placeholders` is not used here: placeholder
+/// images need a [`ProtocolPlacement::KittyUnicode`](crate::ProtocolPlacement)
+/// overlay, which [`encode_protocol`] and
+/// [`ProtocolImage`](crate::ProtocolImage) set up. Text modes are rejected.
 pub async fn render_prepared(
   prepared: &PreparedNativeImage,
   mode: RenderMode,
@@ -129,11 +137,16 @@ pub async fn render_prepared(
   let envelope = ProtocolEnvelope::new(config.passthrough.as_deref());
   match mode {
     RenderMode::Kitty => {
-      let transmit = KittyTransmit::Display {
-        unicode_placeholders: config.kitty_unicode_placeholders,
-      };
       let image_id = image_id.unwrap_or(1);
-      blocking(move || Ok(kitty::encode_image(&image, image_id, transmit, envelope))).await
+      blocking(move || {
+        Ok(kitty::encode_image(
+          &image,
+          image_id,
+          KittyTransmit::Display,
+          envelope,
+        ))
+      })
+      .await
     }
     RenderMode::Iterm2 => blocking(move || iterm::encode(&image, envelope)).await,
     RenderMode::Sixel => blocking(move || sixel::encode(&image, envelope)).await,

@@ -1,7 +1,7 @@
 //! Protocol overlay bookkeeping: which images are on the terminal, which of
 //! them a new frame writes, moves or removes, and in what order.
 
-use std::io::Write;
+use std::{io::Write, sync::Arc};
 
 use anyhow::Result;
 use ratatui::layout::Rect;
@@ -52,17 +52,18 @@ struct ProtocolOverlayState {
   mode: RenderMode,
   placement: Option<ProtocolPlacement>,
   fingerprint: u64,
-  erase: Option<String>,
+  erase: Option<Arc<str>>,
 }
 
 impl ProtocolOverlayState {
   fn of(overlay: &ProtocolOverlay) -> Self {
+    let image = &overlay.image;
     Self {
       area: overlay.area,
-      mode: overlay.mode,
-      placement: overlay.placement.clone(),
-      fingerprint: overlay.fingerprint,
-      erase: overlay.erase.clone(),
+      mode: image.mode,
+      placement: image.placement,
+      fingerprint: image.fingerprint,
+      erase: image.erase.clone(),
     }
   }
 
@@ -146,7 +147,7 @@ impl ProtocolOverlayRenderer {
     // regular terminal diff that follows will then reveal the image without
     // a blank intermediate frame.
     for write in &mut update.writes {
-      if is_kitty_unicode(write.overlay.placement.as_ref()) {
+      if is_kitty_unicode(write.overlay.image.placement.as_ref()) {
         write_protocol_overlay(writer, write.overlay, write.refresh)?;
         write.prewritten = true;
       }
@@ -327,7 +328,7 @@ impl ProtocolOverlayRenderer {
         } else {
           subtract_rects(overlay.area, &unchanged_old_areas)
         },
-        refresh: overlay.refresh.is_some()
+        refresh: overlay.image.refresh.is_some()
           && self
             .state
             .iter()
@@ -446,6 +447,7 @@ fn stable_topological_order<'a>(
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::ProtocolImage;
 
   fn kitty_placement_state(
     area: Rect,
@@ -461,7 +463,7 @@ mod tests {
         placement_id: ids.1,
       }),
       fingerprint,
-      erase: Some(erase.to_string()),
+      erase: Some(erase.into()),
     }
   }
 
@@ -473,44 +475,36 @@ mod tests {
     refresh: Option<&str>,
     erase: &str,
   ) -> ProtocolOverlay {
-    ProtocolOverlay {
-      area,
+    ProtocolImage {
       mode: RenderMode::Kitty,
-      data: data.to_string(),
-      refresh: refresh.map(str::to_string),
+      data: data.into(),
+      refresh: refresh.map(Arc::from),
       placement: Some(ProtocolPlacement::KittyPlacement {
         image_id: ids.0,
         placement_id: ids.1,
       }),
       fingerprint,
-      erase: Some(erase.to_string()),
+      erase: Some(erase.into()),
     }
+    .overlay(area)
   }
 
   fn kitty_unicode_overlay(area: Rect) -> ProtocolOverlay {
-    ProtocolOverlay {
-      area,
+    ProtocolImage {
       mode: RenderMode::Kitty,
-      data: "upload-and-place".to_string(),
-      refresh: Some("place".to_string()),
+      data: "upload-and-place".into(),
+      refresh: Some("place".into()),
       placement: Some(ProtocolPlacement::KittyUnicode {
         image_id: 0x12_34_56,
       }),
       fingerprint: 1,
-      erase: Some("erase".to_string()),
+      erase: Some("erase".into()),
     }
+    .overlay(area)
   }
 
   fn sixel_overlay(area: Rect, fingerprint: u64) -> ProtocolOverlay {
-    ProtocolOverlay {
-      area,
-      mode: RenderMode::Sixel,
-      data: "sixel".to_string(),
-      refresh: None,
-      placement: None,
-      fingerprint,
-      erase: None,
-    }
+    crate::display::test_overlay(area, RenderMode::Sixel, "sixel", fingerprint)
   }
 
   #[test]
@@ -579,12 +573,12 @@ mod tests {
     let old_page = update
       .writes
       .iter()
-      .find(|write| write.overlay.data == "old-page")
+      .find(|write| &*write.overlay.image.data == "old-page")
       .expect("old page write");
     let new_page = update
       .writes
       .iter()
-      .find(|write| write.overlay.data == "new-page")
+      .find(|write| &*write.overlay.image.data == "new-page")
       .expect("new page write");
     assert_eq!(old_page.clear_areas, vec![Rect::new(0, 0, 80, 2)]);
     assert_eq!(new_page.clear_areas, vec![Rect::new(0, 3, 80, 20)]);
@@ -656,18 +650,20 @@ mod tests {
         mode: RenderMode::Kitty,
         placement: Some(ProtocolPlacement::KittyUnicode { image_id: 7 }),
         fingerprint: 1,
-        erase: Some("erase".to_string()),
+        erase: Some("erase".into()),
       }],
     };
-    let overlays = vec![ProtocolOverlay {
-      area: Rect::new(0, 1, 80, 20),
-      mode: RenderMode::Kitty,
-      data: "upload-and-place".to_string(),
-      refresh: Some("virtual-place".to_string()),
-      placement: Some(ProtocolPlacement::KittyUnicode { image_id: 7 }),
-      fingerprint: 1,
-      erase: Some("erase".to_string()),
-    }];
+    let overlays = vec![
+      ProtocolImage {
+        mode: RenderMode::Kitty,
+        data: "upload-and-place".into(),
+        refresh: Some("virtual-place".into()),
+        placement: Some(ProtocolPlacement::KittyUnicode { image_id: 7 }),
+        fingerprint: 1,
+        erase: Some("erase".into()),
+      }
+      .overlay(Rect::new(0, 1, 80, 20)),
+    ];
 
     let mut output = Vec::new();
     let commit = renderer.begin(&mut output, &overlays).unwrap();
@@ -802,7 +798,7 @@ mod tests {
     let update = renderer.update_preserving(&overlays, &[Rect::new(0, 1, 3, 1)]);
 
     assert_eq!(update.writes.len(), 1);
-    assert_eq!(update.writes[0].overlay.data, "new-ready");
+    assert_eq!(&*update.writes[0].overlay.image.data, "new-ready");
     assert!(update.next_state.contains(&old_pending_area));
     assert!(update.next_state.iter().any(|state| state.fingerprint == 3));
     assert!(update.clear_areas.is_empty());
@@ -830,18 +826,20 @@ mod tests {
         mode: RenderMode::Kitty,
         placement: None,
         fingerprint: 1,
-        erase: Some("erase-image-7".to_string()),
+        erase: Some("erase-image-7".into()),
       }],
     };
-    let overlays = vec![ProtocolOverlay {
-      area: Rect::new(0, 1, 3, 1),
-      mode: RenderMode::Kitty,
-      data: "same-image-new-position".to_string(),
-      refresh: None,
-      placement: None,
-      fingerprint: 1,
-      erase: Some("erase-image-7".to_string()),
-    }];
+    let overlays = vec![
+      ProtocolImage {
+        mode: RenderMode::Kitty,
+        data: "same-image-new-position".into(),
+        refresh: None,
+        placement: None,
+        fingerprint: 1,
+        erase: Some("erase-image-7".into()),
+      }
+      .overlay(Rect::new(0, 1, 3, 1)),
+    ];
 
     let update = renderer.update(&overlays);
 
@@ -864,18 +862,20 @@ mod tests {
         erase: None,
       }],
     };
-    let overlays = vec![ProtocolOverlay {
-      area: Rect::new(0, 1, 3, 1),
-      mode: RenderMode::Kitty,
-      data: "place".to_string(),
-      refresh: None,
-      placement: Some(ProtocolPlacement::KittyPlacement {
-        image_id: 7,
-        placement_id: 11,
-      }),
-      fingerprint: 2,
-      erase: None,
-    }];
+    let overlays = vec![
+      ProtocolImage {
+        mode: RenderMode::Kitty,
+        data: "place".into(),
+        refresh: None,
+        placement: Some(ProtocolPlacement::KittyPlacement {
+          image_id: 7,
+          placement_id: 11,
+        }),
+        fingerprint: 2,
+        erase: None,
+      }
+      .overlay(Rect::new(0, 1, 3, 1)),
+    ];
 
     let mut begin_output = Vec::new();
     let commit = renderer.begin(&mut begin_output, &overlays).unwrap();
