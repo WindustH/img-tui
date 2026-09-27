@@ -54,7 +54,7 @@ probe talks to the terminal:
 use img_tui::{NativeImageConfig, RenderMode, capability};
 
 let terminal_capability = capability::detect();
-let modes = capability::render_modes_override_from_env()
+let modes = capability::render_modes_override_from_env("MY_APP_RENDER_MODES")
   .unwrap_or_else(|| terminal_capability.preferred_render_modes("auto"));
 let config = NativeImageConfig {
   cell_pixels: terminal_capability.cell_pixels,
@@ -116,10 +116,11 @@ replacements are not ready yet should stay on screen (`preserve_overlays`).
 
 ### Forcing render modes
 
-Applications that call `render_modes_override_from_env` let users pick modes
-with `GALLERY_TUI_RENDER_MODES`, a comma-separated list such as
-`kitty,symbols`. Accepted values are `kitty`, `sixel`, `iterm`, `symbols`,
-`ascii`, `off` (text only) and `auto` (detect).
+`render_modes_override_from_env("MY_APP_RENDER_MODES")` lets users override
+detection through an environment variable your app names, so each app can be
+forced separately. The value is a comma-separated list in order of
+preference, such as `kitty,symbols`. Accepted values are `kitty`, `sixel`,
+`iterm`, `symbols`, `ascii`, `off` (text only) and `auto` (detect).
 
 ## License
 

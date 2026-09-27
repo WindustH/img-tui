@@ -30,8 +30,8 @@ pub mod native_image;
 pub mod protocol;
 
 pub use capability::{
-  ColorLevel, PixelProtocol, RENDER_MODES_ENV, RenderMode, TerminalCapability, TerminalProbe,
-  detect, render_modes_override_from_env,
+  ColorLevel, PixelProtocol, RenderMode, TerminalCapability, TerminalProbe, detect,
+  render_modes_override_from_env,
 };
 pub use display::{
   ProtocolFrameOutput, ProtocolFrameRenderer, ProtocolOverlayCommit, ProtocolOverlayRenderer,

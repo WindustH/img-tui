@@ -24,11 +24,6 @@ use self::{
   probe::{ProbeRequests, probe_terminal, window_cell_pixels},
 };
 
-/// Environment variable that overrides the detected render modes, e.g.
-/// `kitty,symbols` or `sixel`. `auto` (or an empty value) keeps detection;
-/// `off`/`text` selects only the text fallbacks.
-pub const RENDER_MODES_ENV: &str = "GALLERY_TUI_RENDER_MODES";
-
 /// A pixel graphics protocol the terminal can display.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelProtocol {
@@ -74,14 +69,20 @@ impl RenderMode {
   }
 }
 
-/// Render modes forced through [`RENDER_MODES_ENV`], if it is set to anything
-/// other than `auto`.
-pub fn render_modes_override_from_env() -> Option<Vec<RenderMode>> {
-  let value = env::var(RENDER_MODES_ENV).ok()?;
-  parse_render_modes_override(&value)
+/// Render modes forced through the environment variable `var`, if it is set
+/// to anything other than `auto`.
+///
+/// Each app names its own variable (for example `MY_APP_RENDER_MODES`), so
+/// overriding one app doesn't affect the others. The value is a list of
+/// modes in order of preference, such as `kitty,symbols` or `sixel`; `auto`
+/// (or an empty value) keeps detection, and `off`/`text` selects only the
+/// text fallbacks. Unknown modes are logged and skipped.
+pub fn render_modes_override_from_env(var: &str) -> Option<Vec<RenderMode>> {
+  let value = env::var(var).ok()?;
+  parse_render_modes_override(var, &value)
 }
 
-fn parse_render_modes_override(value: &str) -> Option<Vec<RenderMode>> {
+fn parse_render_modes_override(var: &str, value: &str) -> Option<Vec<RenderMode>> {
   if value.trim().is_empty() || value.trim().eq_ignore_ascii_case("auto") {
     return None;
   }
@@ -104,7 +105,7 @@ fn parse_render_modes_override(value: &str) -> Option<Vec<RenderMode>> {
         push_unique(&mut modes, RenderMode::Ascii);
       }
       unknown => warn!(
-        env = RENDER_MODES_ENV,
+        env = var,
         value,
         token = unknown,
         "ignoring unknown render mode override"
@@ -114,7 +115,7 @@ fn parse_render_modes_override(value: &str) -> Option<Vec<RenderMode>> {
 
   if modes.is_empty() {
     warn!(
-      env = RENDER_MODES_ENV,
+      env = var,
       value, "render mode override did not contain any known modes"
     );
     None
@@ -471,11 +472,17 @@ mod tests {
 
   #[test]
   fn render_modes_override_parses_aliases() {
-    assert_eq!(parse_render_modes_override("auto"), None);
-    assert_eq!(parse_render_modes_override("  "), None);
-    assert_eq!(parse_render_modes_override("bogus"), None);
     assert_eq!(
-      parse_render_modes_override("KGP, sixels:text"),
+      parse_render_modes_override("TEST_RENDER_MODES", "auto"),
+      None
+    );
+    assert_eq!(parse_render_modes_override("TEST_RENDER_MODES", "  "), None);
+    assert_eq!(
+      parse_render_modes_override("TEST_RENDER_MODES", "bogus"),
+      None
+    );
+    assert_eq!(
+      parse_render_modes_override("TEST_RENDER_MODES", "KGP, sixels:text"),
       Some(vec![
         RenderMode::Kitty,
         RenderMode::Sixel,
