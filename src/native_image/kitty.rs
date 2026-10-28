@@ -9,7 +9,10 @@ use std::{
 };
 
 use base64::{Engine, engine::general_purpose::STANDARD};
-use image::DynamicImage;
+use image::{
+  DynamicImage, ImageEncoder,
+  codecs::png::{CompressionType, FilterType, PngEncoder},
+};
 
 use super::{NativeImageViewport, envelope::ProtocolEnvelope, viewport::PixelViewport};
 use crate::RenderMode;
@@ -84,7 +87,7 @@ impl KittyTransmit {
   }
 }
 
-/// Transmit `image` as raw RGB/RGBA pixels in 4096-byte base64 chunks.
+/// Transmit `image` in 4096-byte base64 chunks, using PNG when smaller than raw.
 pub(super) fn encode_image(
   image: &DynamicImage,
   image_id: u32,
@@ -92,6 +95,25 @@ pub(super) fn encode_image(
   envelope: ProtocolEnvelope,
 ) -> Vec<u8> {
   let size = (image.width(), image.height());
+  // Raw RGBA makes a high-DPI screen several megabytes even when most
+  // pixels are identical. Fast PNG dramatically reduces terminal traffic;
+  // retain raw for tiny or incompressible images. Runs on the encoder worker.
+  if image.as_bytes().len() >= 1024 {
+    let mut png = Vec::new();
+    let rgba = image.to_rgba8();
+    if PngEncoder::new_with_quality(&mut png, CompressionType::Fast, FilterType::Adaptive)
+      .write_image(
+        rgba.as_raw(),
+        size.0,
+        size.1,
+        image::ExtendedColorType::Rgba8,
+      )
+      .is_ok()
+      && png.len() < image.as_bytes().len()
+    {
+      return encode_raw(&png, 100, size, image_id, transmit, envelope);
+    }
+  }
   match image {
     DynamicImage::ImageRgb8(image) => {
       encode_raw(image.as_raw(), 24, size, image_id, transmit, envelope)

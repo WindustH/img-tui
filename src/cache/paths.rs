@@ -115,7 +115,12 @@ pub fn is_managed(path: &Path) -> bool {
 }
 pub fn contains(path: &Path) -> bool {
   if let Some((s, ns, k, _)) = lookup(path) {
-    s.images.lock().unwrap().contains_key(path) || s.database.contains(&ns, &k).unwrap_or(false)
+    s.images
+      .lock()
+      .unwrap()
+      .get(path)
+      .is_some_and(|file| file.is_file())
+      || s.database.contains(&ns, &k).unwrap_or(false)
   } else {
     path.exists()
   }
@@ -147,7 +152,13 @@ pub async fn write(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 pub fn materialize(path: &Path) -> Result<PathBuf> {
   if let Some((s, ns, k, _)) = lookup(path) {
-    if let Some(file) = s.images.lock().unwrap().get(path) {
+    if let Some(file) = s
+      .images
+      .lock()
+      .unwrap()
+      .get(path)
+      .filter(|file| file.is_file())
+    {
       return Ok(file.clone());
     }
     let file = s.database.materialize(&ns, &k)?.context("cache miss")?;

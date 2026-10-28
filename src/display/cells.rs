@@ -157,3 +157,40 @@ pub(super) fn flush_stale_overlay_cells(
   }
   repaint
 }
+
+/// Snapshot opaque text surfaces for repaint after pixel-protocol uploads.
+/// Buffer::diff handles wide characters so continuation cells are not emitted
+/// over the preceding glyph. Only surfaces intersecting legacy images need it.
+pub(super) fn occluder_updates(
+  buffer: &Buffer,
+  occluders: &[Rect],
+  image_areas: &[Rect],
+) -> Vec<(u16, u16, Cell)> {
+  let mut updates = Vec::new();
+  for area in occluders {
+    let Some(area) = rect_intersection(*area, buffer.area) else {
+      continue;
+    };
+    if !image_areas
+      .iter()
+      .any(|image| rect_intersection(*image, area).is_some())
+    {
+      continue;
+    }
+    let empty = Buffer::empty(area);
+    let mut text = Buffer::empty(area);
+    for y in area.y..rect_bottom(area) {
+      for x in area.x..rect_right(area) {
+        text[(x, y)] = buffer[(x, y)].clone();
+        text[(x, y)].set_diff_option(CellDiffOption::AlwaysUpdate);
+      }
+    }
+    updates.extend(
+      empty
+        .diff(&text)
+        .into_iter()
+        .map(|(x, y, cell)| (x, y, cell.clone())),
+    );
+  }
+  updates
+}

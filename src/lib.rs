@@ -32,6 +32,7 @@ pub mod chafa;
 pub mod display;
 pub mod native_image;
 pub mod protocol;
+pub mod slicing;
 #[cfg(feature = "terminal")]
 pub mod terminal;
 

@@ -50,6 +50,13 @@ pub struct PreparedNativeImage {
   image: Arc<DynamicImage>,
 }
 
+impl PreparedNativeImage {
+  /// Actual decoded storage, used for weighted caches.
+  pub fn byte_len(&self) -> u64 {
+    self.image.as_bytes().len() as u64
+  }
+}
+
 /// The visible window onto an image laid out over `full_*_cells`, starting
 /// `left_cells`/`top_cells` into it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -85,7 +92,7 @@ pub async fn render_viewport(
   placement_id: Option<u32>,
   include_kitty_upload: bool,
 ) -> Result<Vec<u8>> {
-  let prepared = prepare(
+  let prepared = prepare_cell_grid(
     path,
     viewport.full_width_cells,
     viewport.full_height_cells,
@@ -115,6 +122,26 @@ pub async fn prepare(
   let path = path.to_path_buf();
   let image =
     blocking(move || scale::load_scaled(&path, width_cells, height_cells, cell_pixels)).await?;
+  Ok(PreparedNativeImage {
+    image: Arc::new(image),
+  })
+}
+
+/// Decode an image onto an exact terminal-cell pixel grid, including upscaling.
+///
+/// The caller must first fit the cell box to the image's aspect ratio. Unlike
+/// [`prepare`], this fills every pixel of that box, avoiding fractional cell
+/// boundaries when a full image is cropped into adjacent scroll slices.
+/// EXIF orientation and color management match [`prepare`].
+pub async fn prepare_cell_grid(
+  path: &Path,
+  width_cells: u16,
+  height_cells: u16,
+  cell_pixels: Option<(u16, u16)>,
+) -> Result<PreparedNativeImage> {
+  let path = path.to_path_buf();
+  let image =
+    blocking(move || scale::load_cell_grid(&path, width_cells, height_cells, cell_pixels)).await?;
   Ok(PreparedNativeImage {
     image: Arc::new(image),
   })
@@ -194,6 +221,18 @@ pub async fn render_prepared_viewport(
     }
     RenderMode::Symbols | RenderMode::Ascii => bail!("{} is not a native image mode", mode.label()),
   }
+}
+
+/// Encode a visible slice directly from shared decoded pixels, without a PNG
+/// file round trip. `spec` must describe the visible cell dimensions.
+pub async fn encode_protocol_viewport(
+  prepared: &PreparedNativeImage,
+  viewport: NativeImageViewport,
+  spec: &ProtocolImageSpec,
+  config: &NativeImageConfig,
+) -> Result<EncodedProtocolImage> {
+  let cropped = crop_prepared(prepared, viewport).await?;
+  encode_protocol(&cropped, spec, config).await
 }
 
 /// Upload `prepared` to the terminal under `image_id` without displaying it.
@@ -288,7 +327,7 @@ pub async fn encode_viewport_png(
   viewport: NativeImageViewport,
   cell_pixels: Option<(u16, u16)>,
 ) -> Result<Vec<u8>> {
-  let prepared = prepare(
+  let prepared = prepare_cell_grid(
     path,
     viewport.full_width_cells,
     viewport.full_height_cells,

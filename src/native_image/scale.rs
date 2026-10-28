@@ -30,12 +30,37 @@ pub(super) fn load_scaled(
   height_cells: u16,
   cell_pixels: Option<(u16, u16)>,
 ) -> Result<DynamicImage> {
+  load_for_cells(path, width_cells, height_cells, cell_pixels, false)
+}
+
+/// Rasterize an already aspect-fitted cell box onto its exact pixel grid.
+/// Adjacent slices can then use integer cell-pixel boundaries without overlaps.
+pub(super) fn load_cell_grid(
+  path: &Path,
+  width_cells: u16,
+  height_cells: u16,
+  cell_pixels: Option<(u16, u16)>,
+) -> Result<DynamicImage> {
+  load_for_cells(path, width_cells, height_cells, cell_pixels, true)
+}
+
+fn load_for_cells(
+  path: &Path,
+  width_cells: u16,
+  height_cells: u16,
+  cell_pixels: Option<(u16, u16)>,
+  exact_grid: bool,
+) -> Result<DynamicImage> {
   let decoded = decode_image(path)?;
   let (cell_width, cell_height) = cell_pixels.unwrap_or(DEFAULT_CELL_PIXELS);
   let max_width = u32::from(width_cells.max(1)) * u32::from(cell_width.max(1));
   let max_height = u32::from(height_cells.max(1)) * u32::from(cell_height.max(1));
   let (max_width, max_height) = flip_size(decoded.orientation, (max_width, max_height));
-  let (target_width, target_height) = fit_pixel_size(decoded.size, (max_width, max_height));
+  let (target_width, target_height) = if exact_grid {
+    (max_width, max_height)
+  } else {
+    fit_pixel_size(decoded.size, (max_width, max_height))
+  };
 
   let mut image = decoded.image;
   if image.width() != target_width || image.height() != target_height {

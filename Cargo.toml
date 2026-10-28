@@ -1,6 +1,6 @@
 [package]
 name = "img-tui"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT"
@@ -14,7 +14,7 @@ terminal = ["dep:framework-tui"]
 chafa = ["tokio/process", "dep:ansi-to-tui"]
 
 [dependencies]
-framework-tui = { git = "https://github.com/WindustH/framework-tui", rev = "9bf5c96ce355cbbd675f864b41bc08d9de2bd1a1", optional = true }
+framework-tui = { git = "https://github.com/WindustH/framework-tui", rev = "584cbdb227734aeb6ae1f016b18d50e0ad347984", optional = true }
 ansi-to-tui = { version = "8.0.1", optional = true }
 zstd = { version = "0.13.3", features = ["zstdmt"], optional = true }
 moka = { version = "0.12.16", features = ["sync"], optional = true }
@@ -32,7 +32,7 @@ palette = "0.7.6"
 quantette = "0.6.0"
 ratatui = "0.30.2"
 rayon = "1.12.0"
-tokio = { version = "1.52.3", features = ["rt"] }
+tokio = { version = "1.52.3", features = ["rt", "sync"] }
 tracing = "0.1.44"
 unicode-width = "0.2.2"
 

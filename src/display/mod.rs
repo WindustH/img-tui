@@ -21,7 +21,7 @@ use self::{
     ProtectedArea, flush_stale_overlay_cells, restore_protected_areas, snapshot_protocol_areas,
   },
   placeholder::{clip_wide_glyphs_crossing_occluder_left_edges, fill_kitty_unicode_placeholders},
-  rect::{intersect_rects, rect_contained_by_any, rect_intersects_any},
+  rect::{intersect_rects, rect_contained_by_any, rect_intersects_any, subtract_rects},
   write::{queue_cursor_state, write_protocol_overlay, write_protocol_writes},
 };
 pub use self::{
@@ -29,7 +29,7 @@ pub use self::{
   overlay::{ProtocolOverlayCommit, ProtocolOverlayRenderer},
   write::reset_protocol_images,
 };
-use crate::ProtocolOverlay;
+use crate::{ProtocolOverlay, ProtocolPlacement};
 
 /// Draws ratatui frames and the protocol images they carry. Keep one per
 /// terminal and route every draw through it.
@@ -133,6 +133,20 @@ impl ProtocolFrameRenderer {
       );
       snapshot_areas.extend(plan.protected_old_areas.iter().copied());
     }
+    // Pixel protocols are written after the text flush. Paint their occluding
+    // text again afterwards; Unicode placements instead clip through cells.
+    let legacy_areas: Vec<_> = output
+      .overlays
+      .iter()
+      .filter(|overlay| {
+        !matches!(
+          overlay.image.placement,
+          Some(ProtocolPlacement::KittyUnicode { .. })
+        )
+      })
+      .map(|overlay| overlay.area)
+      .collect();
+    let overlay_text = cells::occluder_updates(buffer, &output.occluders, &legacy_areas);
     let protected_cells = snapshot_protocol_areas(buffer, snapshot_areas);
 
     terminal.flush()?;
@@ -143,6 +157,9 @@ impl ProtocolFrameRenderer {
     self.overlays.finish(backend, commit)?;
     for index in repaint_overlays {
       write_protocol_overlay(backend, &output.overlays[index], false)?;
+    }
+    if !overlay_text.is_empty() {
+      backend.draw(overlay_text.iter().map(|(x, y, cell)| (*x, *y, cell)))?;
     }
     queue_cursor_state(backend, output.cursor_position)?;
     Write::flush(backend)?;
@@ -208,7 +225,10 @@ impl PreservePlan {
       .filter(|area| rect_contained_by_any(*area, &preserve_areas))
       .filter(|area| !rect_intersects_any(*area, &new_areas))
       .collect::<Vec<_>>();
-    let protected_old_areas = intersect_rects(&preservable_old_areas, &preserve_areas);
+    let protected_old_areas = intersect_rects(&preservable_old_areas, &preserve_areas)
+      .into_iter()
+      .flat_map(|area| subtract_rects(area, &output.occluders))
+      .collect();
     Self {
       preserve_areas,
       protected_old_areas,

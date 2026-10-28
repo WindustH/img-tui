@@ -168,3 +168,25 @@ not be registered as cache namespaces.
 Applications retain render scheduling, cancellation, frame readiness and
 source generation. Share this implementation across applications, while
 keeping an independent database and budgets for each application.
+
+
+## Sliced images
+
+`NativeImageViewport::slices(height)` plans fixed image-local strips for both
+visible drawing and preloading. `screen_area` places a strip inside its visible
+window; `cache_fragment` identifies its full geometry independently of screen
+position. `SliceGrid::Even` provides proportional boundaries when the caller
+needs a shared grid across multiple images. `PixelRegion` handles exact raster
+crops; cell-to-pixel mapping uses identical edges for adjacent slices.
+
+Prepare the full aspect-fitted image with `native_image::prepare_cell_grid`,
+then encode a window with `encode_protocol_viewport` (or
+`encode_prepared_viewport_png` for an external text renderer). With the `cache`
+feature, `slicing::PreparedImageCache` shares concurrent source decodes and
+keeps prepared images in a byte-weighted cache. Different sources prepare in
+parallel. The source identity must include file revision information.
+
+The caller owns scroll position, divisor defaults, preload range, and the choice
+between whole-image and sliced rendering. Grid/list rendering need not slice.
+Kitty uploads choose fast PNG when smaller than raw pixels to reduce terminal
+traffic; the other protocol encoders retain their existing formats.

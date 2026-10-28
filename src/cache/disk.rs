@@ -39,7 +39,14 @@ impl DiskCache {
         size INTEGER NOT NULL, accessed INTEGER NOT NULL,
         PRIMARY KEY(namespace,key));
       CREATE INDEX IF NOT EXISTS cache_lru ON cache_entries(accessed);
-      PRAGMA user_version=1;",
+      BEGIN IMMEDIATE;
+      CREATE TABLE IF NOT EXISTS cache_totals (id INTEGER PRIMARY KEY CHECK(id=1), bytes INTEGER NOT NULL);
+      INSERT OR IGNORE INTO cache_totals SELECT 1, COALESCE(SUM(size),0) FROM cache_entries;
+      CREATE TRIGGER IF NOT EXISTS cache_total_insert AFTER INSERT ON cache_entries BEGIN UPDATE cache_totals SET bytes=bytes+NEW.size WHERE id=1; END;
+      CREATE TRIGGER IF NOT EXISTS cache_total_delete AFTER DELETE ON cache_entries BEGIN UPDATE cache_totals SET bytes=bytes-OLD.size WHERE id=1; END;
+      CREATE TRIGGER IF NOT EXISTS cache_total_update AFTER UPDATE OF size ON cache_entries BEGIN UPDATE cache_totals SET bytes=bytes+NEW.size-OLD.size WHERE id=1; END;
+      PRAGMA user_version=2;
+      COMMIT;",
     )?;
     Ok(Self {
       inner: Arc::new(Inner {
@@ -105,10 +112,9 @@ impl DiskCache {
       ON CONFLICT(namespace,key) DO UPDATE SET payload=excluded.payload,size=excluded.size,accessed=excluded.accessed",
       params![namespace,key,bytes,bytes.len() as i64,now()])?;
     if max_bytes > 0 {
-      let mut total: u64 =
-        tx.query_row("SELECT COALESCE(SUM(size),0) FROM cache_entries", [], |r| {
-          r.get(0)
-        })?;
+      let mut total: u64 = tx.query_row("SELECT bytes FROM cache_totals WHERE id=1", [], |r| {
+        r.get(0)
+      })?;
       let victims = if total > max_bytes {
         let mut stmt = tx.prepare("SELECT namespace,key,size FROM cache_entries WHERE NOT(namespace=?1 AND key=?2) ORDER BY accessed,namespace,key")?;
         stmt
@@ -198,10 +204,11 @@ impl DiskCache {
     self.materialize_bytes(&bytes).map(Some)
   }
   pub fn materialize_bytes(&self, bytes: &[u8]) -> Result<PathBuf> {
-    let digest = Sha256::digest(bytes)
-      .iter()
-      .map(|b| format!("{b:02x}"))
-      .collect::<String>();
+    use std::fmt::Write;
+    let mut digest = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+      write!(&mut digest, "{byte:02x}").expect("writing to a String");
+    }
     let extension = image::guess_format(bytes)
       .ok()
       .and_then(|format| format.extensions_str().first().copied())
