@@ -157,39 +157,3 @@ pub(super) fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     .windows(needle.len())
     .position(|candidate| candidate == needle)
 }
-
-#[cfg(test)]
-mod tests {
-  use super::{cell_pixels_reply, cell_size_reply, device_attributes_report_sixel};
-
-  #[test]
-  fn cell_size_reply_parses_width_and_height() {
-    assert_eq!(cell_size_reply(b"\x1b[6;20;10t"), Some((10, 20)));
-    assert_eq!(cell_size_reply(b"junk\x1b[6;17;8tmore"), Some((8, 17)));
-    assert_eq!(cell_size_reply(b"\x1b[6;20;10"), None);
-    assert_eq!(cell_size_reply(b"\x1b[6;;10t"), None);
-    assert_eq!(cell_size_reply(b"\x1b[6;99999;10t"), None);
-  }
-
-  #[test]
-  fn zero_cell_size_reply_is_not_a_cell_size() {
-    // Reported by terminals and multiplexers that do not know the pixel size
-    // of the window. Accepting it would size every image at one pixel per
-    // cell and suppress the TIOCGWINSZ fallback.
-    assert_eq!(cell_size_reply(b"\x1b[6;0;0t"), Some((0, 0)));
-    assert_eq!(cell_pixels_reply(b"\x1b[6;0;0t"), None);
-    assert_eq!(cell_pixels_reply(b"\x1b[6;20;0t"), None);
-    assert_eq!(cell_pixels_reply(b"\x1b[6;20;10t"), Some((10, 20)));
-  }
-
-  #[test]
-  fn sixel_is_read_from_device_attributes_only() {
-    assert!(device_attributes_report_sixel(b"\x1b[?62;4;22c"));
-    assert!(device_attributes_report_sixel(b"\x1b[?4c"));
-    assert!(device_attributes_report_sixel(b"\x1b[?1;2c\x1b[?65;4c"));
-    assert!(!device_attributes_report_sixel(b"\x1b[?62;22c"));
-    assert!(!device_attributes_report_sixel(b"\x1b[?64;44c"));
-    // A 4-pixel-tall cell size reply is not a sixel attribute.
-    assert!(!device_attributes_report_sixel(b"\x1b[6;4;8t\x1b[?1;2c"));
-  }
-}

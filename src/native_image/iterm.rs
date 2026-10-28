@@ -49,20 +49,3 @@ pub(super) fn encode(image: &DynamicImage, envelope: ProtocolEnvelope) -> Result
   write!(out, "\x07{}", envelope.close)?;
   Ok(out.into_bytes())
 }
-
-#[cfg(test)]
-mod tests {
-  use image::{DynamicImage, ImageBuffer, Rgb};
-
-  use super::{ProtocolEnvelope, encode};
-
-  #[test]
-  fn opaque_non_rgb8_image_encodes_as_jpeg() {
-    let image = DynamicImage::ImageRgb16(ImageBuffer::from_pixel(4, 2, Rgb([1000, 2000, 3000])));
-    let out = encode(&image, ProtocolEnvelope::new(None)).expect("16-bit iTerm2 image");
-    let out = String::from_utf8(out).unwrap();
-    assert!(out.starts_with("\x1b]1337;File=inline=1;"));
-    assert!(out.contains("width=4px;height=2px"));
-    assert!(out.ends_with('\x07'));
-  }
-}

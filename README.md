@@ -125,3 +125,46 @@ preference, such as `kitty,symbols`. Accepted values are `kitty`, `sixel`,
 ## License
 
 MIT
+
+## Optional integrations
+
+The default image renderer does not compile SQLite, moka or zstd. Enable
+`cache` for shared caches, `chafa` for the text fallback and ANSI decoding,
+and `terminal` for `terminal::ProtocolTui` (which uses framework-tui).
+The terminal feature pins framework-tui from Git, so this repository also
+builds without a sibling checkout. Applications using a framework-tui
+submodule patch that Git dependency to their local copy.
+`ProtocolTui` buffers 256 KiB by default and flushes at frame and session
+boundaries; `with_options` accepts an explicit terminal configuration.
+
+## Shared caches
+
+With the `cache` feature, `cache::MemoryCache<K, V>` uses moka's explicit LRU policy with byte weights
+and returns `Arc<V>` read leases. A zero budget is unlimited; one oversized
+result is retained separately so small budgets do not prevent rendering.
+
+`cache::DiskCache` stores namespace/key/BLOB entries in `cache.sqlite3`, with
+WAL, busy timeout, short transactions, bounded writes and independent disk
+LRU. `put_bounded` retains its newest entry if that entry alone exceeds the
+budget. Budgets count live payload bytes, not database pages/WAL or active
+temporary files. `trim`/`clear` checkpoint and incrementally vacuum the DB.
+Call synchronous database methods on worker threads, never in frame drawing.
+
+`cache::payload` encodes terminal data plus optional refresh sequences using
+a shared versioned zstd format; decoding validates render dimensions, terminal
+cell size, mode and protocol IDs.
+
+`cache::paths::CachePaths` adapts logical cache paths to database entries
+for applications with file-only tools. Keep its `Arc` guard alive for the
+application session. Registered namespaces must contain disposable cache data
+only. Image files are content-addressed temporary materializations; their
+identities and modification timestamps are stable across sessions. Active
+materializations are kept until normal session shutdown, independently of
+SQLite eviction. Each `NamespaceSpec` explicitly selects its prefix, database
+namespace, optional extension filter and materialization policy. Legacy cache
+cleanup is owned by each application. Configuration, logs and application state must
+not be registered as cache namespaces.
+
+Applications retain render scheduling, cancellation, frame readiness and
+source generation. Share this implementation across applications, while
+keeping an independent database and budgets for each application.

@@ -24,10 +24,16 @@
 //! have been written. Unchanged images are not rewritten, so frames never
 //! show a blank intermediate state.
 
+#[cfg(feature = "cache")]
+pub mod cache;
 pub mod capability;
+#[cfg(feature = "chafa")]
+pub mod chafa;
 pub mod display;
 pub mod native_image;
 pub mod protocol;
+#[cfg(feature = "terminal")]
+pub mod terminal;
 
 pub use capability::{
   ColorLevel, PixelProtocol, RenderMode, TerminalCapability, TerminalProbe, detect,

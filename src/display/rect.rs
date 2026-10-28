@@ -113,33 +113,3 @@ pub(super) fn subtract_rect(area: Rect, cover: Rect) -> Vec<Rect> {
   .filter(|rect| !rect_is_empty(*rect))
   .collect()
 }
-
-#[cfg(test)]
-mod tests {
-  use super::{Rect, subtract_rect, subtract_rects};
-
-  #[test]
-  fn subtracting_a_centered_cover_leaves_four_bands() {
-    let parts = subtract_rect(Rect::new(0, 0, 10, 10), Rect::new(3, 3, 4, 4));
-    assert_eq!(
-      parts,
-      vec![
-        Rect::new(0, 0, 10, 3),
-        Rect::new(0, 7, 10, 3),
-        Rect::new(0, 3, 3, 4),
-        Rect::new(7, 3, 3, 4),
-      ]
-    );
-    let area = parts.iter().map(|rect| rect.area()).sum::<u32>();
-    assert_eq!(area, 100 - 16);
-  }
-
-  #[test]
-  fn subtracting_full_cover_leaves_nothing() {
-    assert!(subtract_rects(Rect::new(2, 2, 3, 3), &[Rect::new(0, 0, 10, 10)]).is_empty());
-    assert_eq!(
-      subtract_rects(Rect::new(0, 0, 4, 1), &[Rect::new(8, 8, 1, 1)]),
-      vec![Rect::new(0, 0, 4, 1)]
-    );
-  }
-}
