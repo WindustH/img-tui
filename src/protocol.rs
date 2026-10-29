@@ -46,6 +46,8 @@ pub struct ProtocolImage {
   /// changes.
   pub refresh: Option<Arc<str>>,
   pub placement: Option<ProtocolPlacement>,
+  /// Validated source geometry for clipping regular Kitty placements.
+  pub kitty_geometry: Option<native_image::KittyPlacementGeometry>,
   /// Identifies the image content; a different value forces a rewrite.
   pub fingerprint: u64,
   /// Sequence that deletes the image from the terminal (kitty only).
@@ -77,7 +79,7 @@ impl ProtocolImage {
   /// Fails when the bytes are not UTF-8, when a kitty placement sequence the
   /// spec calls for is missing, or for text render modes.
   pub fn from_encoded(
-    encoded: EncodedProtocolImage,
+    mut encoded: EncodedProtocolImage,
     spec: &ProtocolImageSpec,
     config: &NativeImageConfig,
   ) -> Result<Self> {
@@ -110,6 +112,24 @@ impl ProtocolImage {
       bail!("kitty image bytes lack the placement sequence");
     }
 
+    // Normalize cached virtual placements as well: a fixed placement id makes
+    // a later refresh replace the placement instead of allocating another one.
+    if let Some(ProtocolPlacement::KittyUnicode { image_id }) = placement {
+      let refresh = native_image::render_kitty_virtual_placement(
+        config,
+        image_id,
+        spec.width_cells,
+        spec.height_cells,
+      );
+      let previous = encoded.refresh.as_ref().expect("placement checked above");
+      if !encoded.data.ends_with(previous) {
+        bail!("kitty Unicode payload lacks its trailing virtual placement");
+      }
+      encoded.data.truncate(encoded.data.len() - previous.len());
+      encoded.data.extend_from_slice(&refresh);
+      encoded.refresh = Some(refresh);
+    }
+
     let fingerprint = fingerprint(&encoded.data, encoded.refresh.as_deref());
     let data = String::from_utf8(encoded.data).context("image data is not UTF-8")?;
     let refresh = encoded
@@ -117,11 +137,26 @@ impl ProtocolImage {
       .map(String::from_utf8)
       .transpose()
       .context("image refresh sequence is not UTF-8")?;
+    let kitty_geometry = if let Some(ProtocolPlacement::KittyPlacement {
+      image_id,
+      placement_id,
+    }) = placement
+    {
+      Some(native_image::KittyPlacementGeometry::decode(
+        refresh.as_deref().context("missing Kitty placement")?,
+        passthrough,
+        image_id,
+        placement_id,
+      )?)
+    } else {
+      None
+    };
     Ok(Self {
       mode: spec.mode,
       data: data.into(),
       refresh: refresh.map(Arc::from),
       placement,
+      kitty_geometry,
       fingerprint,
       erase: erase.map(Arc::from),
     })

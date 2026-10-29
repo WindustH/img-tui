@@ -34,6 +34,19 @@ impl ProtocolTui {
   /// Enter with caller-selected output and buffering policy.
   pub fn with_options(protocol_reset: Option<String>, options: TerminalOptions) -> Result<Self> {
     let mut session = TerminalSession::enter(options)?;
+    if std::env::var_os("TMUX").is_some()
+      && std::env::var_os("ZELLIJ").is_none()
+      && std::env::var_os("ZELLIJ_SESSION_NAME").is_none()
+    {
+      // tmux otherwise enters TTY_BLOCK on a large placeholder-text diff and
+      // discards subsequent graphics passthrough, which it cannot reconstruct.
+      // An empty passthrough sets TTY_NOBLOCK without altering the host screen.
+      // Delimit small cell batches: a guard only at frame start is insufficient
+      // if tmux drains its output queue partway through that frame.
+      session
+        .backend_mut()
+        .set_draw_batching(Some((32, b"\x1bPtmux;\x1b\\")));
+    }
     reset_protocol_images(session.backend_mut(), protocol_reset.as_deref())?;
     Ok(Self {
       session,

@@ -6,6 +6,7 @@
 //! are erased, and the text beneath them is redrawn exactly where needed.
 
 mod cells;
+mod clip;
 mod overlay;
 mod placeholder;
 mod rect;
@@ -21,7 +22,7 @@ use self::{
     ProtectedArea, flush_stale_overlay_cells, restore_protected_areas, snapshot_protocol_areas,
   },
   placeholder::{clip_wide_glyphs_crossing_occluder_left_edges, fill_kitty_unicode_placeholders},
-  rect::{intersect_rects, rect_contained_by_any, rect_intersects_any, subtract_rects},
+  rect::{rect_contained_by_any, rect_intersects_any, subtract_rects},
   write::{queue_cursor_state, write_protocol_overlay, write_protocol_writes},
 };
 pub use self::{
@@ -38,6 +39,8 @@ pub struct ProtocolFrameRenderer {
   overlays: ProtocolOverlayRenderer,
   /// Cells flushed beneath each overlay by the previous frame.
   protected_cells: Vec<ProtectedArea>,
+  /// Unclipped placements retained while their replacement is loading.
+  source_overlays: Vec<ProtocolOverlay>,
 }
 
 /// What a frame's render closure returns besides the text it drew.
@@ -55,7 +58,8 @@ pub struct ProtocolFrameOutput {
   /// Limit `preserve_overlays` to images inside these areas; empty means
   /// every earlier image.
   pub preserve_areas: Vec<Rect>,
-  /// Modal rectangles whose text cells replace kitty U=1 placeholders.
+  /// Floating text rectangles: mask Kitty Unicode cells and crop regular
+  /// Kitty placements around them without changing layout geometry.
   pub occluders: Vec<Rect>,
 }
 
@@ -79,15 +83,45 @@ impl ProtocolFrameRenderer {
       // Everything the terminal showed is gone; what we remember about it
       // would suppress the rewrites the new frame needs.
       self.protected_cells.clear();
+      self.source_overlays.clear();
       self
         .overlays
         .forget_cleared_images(terminal.backend_mut())?;
     }
 
-    let output = {
+    let mut output = {
       let mut frame = terminal.get_frame();
       render(&mut frame)
     };
+    // Preserve original geometry, then apply this frame's occlusion to both
+    // fresh and retained images. Otherwise a loading image can leak through
+    // a newly opened popup, or stay cropped after that popup closes.
+    let new_overlay_count = output.overlays.len();
+    if output.preserve_overlays && !screen_cleared {
+      let new_areas: Vec<_> = output.overlays.iter().map(|image| image.area).collect();
+      output.overlays.extend(
+        self
+          .source_overlays
+          .iter()
+          .filter(|image| {
+            (output.preserve_areas.is_empty()
+              || rect_contained_by_any(image.area, &output.preserve_areas))
+              && !rect_intersects_any(image.area, &new_areas)
+          })
+          .cloned(),
+      );
+    }
+    let preserved_areas = output.overlays[new_overlay_count..]
+      .iter()
+      .flat_map(|image| subtract_rects(image.area, &output.occluders))
+      .collect::<Vec<_>>();
+    restore_protected_areas(
+      terminal.current_buffer_mut(),
+      &self.protected_cells,
+      preserved_areas,
+    );
+    self.source_overlays.clone_from(&output.overlays);
+    output.overlays = clip::clip_overlays(output.overlays, &output.occluders);
     let buffer = terminal.current_buffer_mut();
     clip_wide_glyphs_crossing_occluder_left_edges(buffer, &output.occluders);
     // U=1 kitty images display through unicode placeholder *text cells*.
@@ -96,21 +130,9 @@ impl ProtocolFrameRenderer {
     // (the text diff then carries placeholder/restore updates for free).
     fill_kitty_unicode_placeholders(buffer, &output.overlays, &output.occluders);
 
-    // After a screen clear only the images this frame lists get drawn again,
-    // so earlier ones cannot be kept on screen.
-    let preserve = (output.preserve_overlays && !screen_cleared && !self.overlays.is_empty())
-      .then(|| PreservePlan::new(&self.overlays, &output));
-    let commit = {
-      let backend = terminal.backend_mut();
-      match &preserve {
-        Some(plan) => {
-          self
-            .overlays
-            .begin_preserving(backend, &output.overlays, &plan.preserve_areas)?
-        }
-        None => self.overlays.begin(backend, &output.overlays)?,
-      }
-    };
+    let commit = self
+      .overlays
+      .begin(terminal.backend_mut(), &output.overlays)?;
 
     let buffer = terminal.current_buffer_mut();
     let mut forced_areas = commit.clear_areas().to_vec();
@@ -120,19 +142,11 @@ impl ProtocolFrameRenderer {
     // Overlays written in full after the flush need no second repaint.
     repaint_overlays.retain(|index| !commit.writes_in_full(*index));
     force_update_areas(buffer, &forced_areas);
-    let mut snapshot_areas = output
+    let snapshot_areas = output
       .overlays
       .iter()
       .map(|overlay| overlay.area)
       .collect::<Vec<_>>();
-    if let Some(plan) = &preserve {
-      restore_protected_areas(
-        buffer,
-        &self.protected_cells,
-        plan.protected_old_areas.iter().copied(),
-      );
-      snapshot_areas.extend(plan.protected_old_areas.iter().copied());
-    }
     // Pixel protocols are written after the text flush. Paint their occluding
     // text again afterwards; Unicode placements instead clip through cells.
     let legacy_areas: Vec<_> = output
@@ -171,6 +185,7 @@ impl ProtocolFrameRenderer {
   /// Erase every image and blank its area, e.g. before suspending.
   pub fn clear(&mut self, writer: &mut impl Write) -> Result<()> {
     self.protected_cells.clear();
+    self.source_overlays.clear();
     self.overlays.clear(writer)
   }
 
@@ -198,42 +213,6 @@ where
   let before = terminal.current_buffer_mut().area;
   terminal.autoresize()?;
   Ok(terminal.current_buffer_mut().area != before)
-}
-
-/// Which earlier images a preserving frame keeps, and the parts of them whose
-/// text cells must be restored rather than redrawn.
-struct PreservePlan {
-  preserve_areas: Vec<Rect>,
-  protected_old_areas: Vec<Rect>,
-}
-
-impl PreservePlan {
-  fn new(overlays: &ProtocolOverlayRenderer, output: &ProtocolFrameOutput) -> Self {
-    let old_areas = overlays.areas().collect::<Vec<_>>();
-    let new_areas = output
-      .overlays
-      .iter()
-      .map(|overlay| overlay.area)
-      .collect::<Vec<_>>();
-    let preserve_areas = if output.preserve_areas.is_empty() {
-      old_areas.clone()
-    } else {
-      output.preserve_areas.clone()
-    };
-    let preservable_old_areas = old_areas
-      .into_iter()
-      .filter(|area| rect_contained_by_any(*area, &preserve_areas))
-      .filter(|area| !rect_intersects_any(*area, &new_areas))
-      .collect::<Vec<_>>();
-    let protected_old_areas = intersect_rects(&preservable_old_areas, &preserve_areas)
-      .into_iter()
-      .flat_map(|area| subtract_rects(area, &output.occluders))
-      .collect();
-    Self {
-      preserve_areas,
-      protected_old_areas,
-    }
-  }
 }
 
 impl ProtocolFrameOutput {

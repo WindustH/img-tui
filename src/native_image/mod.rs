@@ -12,6 +12,7 @@
 
 mod encode;
 mod envelope;
+mod geometry;
 mod iterm;
 mod kitty;
 mod scale;
@@ -30,6 +31,7 @@ pub use self::{
 };
 use self::{envelope::ProtocolEnvelope, kitty::KittyTransmit};
 use crate::RenderMode;
+pub use geometry::KittyPlacementGeometry;
 
 /// Terminal facts the encoders need, usually derived from
 /// [`TerminalCapability`](crate::TerminalCapability).

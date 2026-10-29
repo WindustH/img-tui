@@ -204,7 +204,7 @@ pub(super) fn virtual_placement(
 ) -> Vec<u8> {
   envelope
     .kitty_command(format_args!(
-      "q=2,a=p,U=1,i={},c={},r={}",
+      "q=2,a=p,U=1,p=1,i={},c={},r={}",
       image_id.max(1),
       cols.max(1),
       rows.max(1)

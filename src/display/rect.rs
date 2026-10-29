@@ -45,18 +45,6 @@ pub(super) fn rect_contained_by_any(area: Rect, clips: &[Rect]) -> bool {
   clips.iter().any(|clip| rect_contains(*clip, area))
 }
 
-/// Pairwise intersections of `areas` with `clips`.
-pub(super) fn intersect_rects(areas: &[Rect], clips: &[Rect]) -> Vec<Rect> {
-  areas
-    .iter()
-    .flat_map(|area| {
-      clips
-        .iter()
-        .filter_map(move |clip| rect_intersection(*area, *clip))
-    })
-    .collect()
-}
-
 /// Parts of `area` not covered by any of `covers`.
 pub(super) fn subtract_rects(area: Rect, covers: &[Rect]) -> Vec<Rect> {
   let mut remaining = vec![area];

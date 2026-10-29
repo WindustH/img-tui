@@ -360,3 +360,10 @@ fn color_level(term_lower: &str, program_lower: &str, colorterm: Option<&str>) -
     ColorLevel::Ansi16
   }
 }
+
+/// Re-read the OS-reported terminal cell size without reading stdin or sending
+/// terminal queries, so an active input reader can keep running during resize.
+/// `None` means the caller must use its documented pixel-size fallback.
+pub fn current_cell_pixels() -> Option<(u16, u16)> {
+  window_cell_pixels()
+}

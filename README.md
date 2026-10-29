@@ -105,13 +105,12 @@ renderer.draw(&mut terminal, |frame| {
   ProtocolFrameOutput::new(vec![image.overlay(area)], None)
 })?;
 
-// Before suspending or exiting: remove the images.
-let reset = native_image::erase_sequence(RenderMode::Kitty, config.passthrough.as_deref(), None);
-renderer.clear_and_reset(terminal.backend_mut(), reset.as_deref())?;
+// Before suspending or exiting: remove this renderer's images only.
+renderer.clear_and_reset(terminal.backend_mut(), None)?;
 ```
 
 `ProtocolFrameOutput` also carries the cursor position, rectangles of dialogs
-drawn over kitty placeholder images (`occluders`), and whether images whose
+drawn over Kitty images (`occluders`: placeholder cells are masked, regular placements are cropped), and whether images whose
 replacements are not ready yet should stay on screen (`preserve_overlays`).
 
 ### Forcing render modes
@@ -190,3 +189,16 @@ The caller owns scroll position, divisor defaults, preload range, and the choice
 between whole-image and sliced rendering. Grid/list rendering need not slice.
 Kitty uploads choose fast PNG when smaller than raw pixels to reduce terminal
 traffic; the other protocol encoders retain their existing formats.
+
+For regular Kitty placements, changing the crop first deletes the old placement, then places the new crop using the existing upload. This avoids a Zellij 0.45.1 host-mapping issue: a new scaled image can reuse the placement UID while the previous host image/placement pair remains on screen. Ordinary movement does not require this replacement.
+
+Inside tmux, `ProtocolTui` delimits small batches of text updates with empty
+passthrough sequences. This keeps tmux out of its output-discard mode: it can
+reconstruct text after dropping output, but cannot reconstruct Kitty uploads.
+A single guard at frame start is insufficient when the output queue drains
+mid-frame. Image uploads remain cursor-free for Unicode placements.
+
+Encoded Kitty payloads contain session-owned image IDs. Applications using fresh
+IDs per session cannot reuse those payloads across launches; source, raster and
+prepared-image caches remain reusable. Do not use global Kitty deletion to make
+stable IDs safe: it can erase another application’s images.

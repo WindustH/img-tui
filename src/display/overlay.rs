@@ -43,6 +43,9 @@ struct ProtocolOverlayWrite<'a> {
   state: ProtocolOverlayState,
   clear_areas: Vec<Rect>,
   refresh: bool,
+  /// Zellij can map new crop geometry to a different host image while
+  /// reusing its placement UID. Delete first so it retires the old host pair.
+  replace_placement: bool,
   prewritten: bool,
 }
 
@@ -52,6 +55,8 @@ struct ProtocolOverlayState {
   mode: RenderMode,
   placement: Option<ProtocolPlacement>,
   fingerprint: u64,
+  /// Cropping can change source pixels without changing the destination area.
+  refresh: Option<Arc<str>>,
   erase: Option<Arc<str>>,
 }
 
@@ -63,6 +68,7 @@ impl ProtocolOverlayState {
       mode: image.mode,
       placement: image.placement,
       fingerprint: image.fingerprint,
+      refresh: image.refresh.clone(),
       erase: image.erase.clone(),
     }
   }
@@ -147,7 +153,7 @@ impl ProtocolOverlayRenderer {
     // regular terminal diff that follows will then reveal the image without
     // a blank intermediate frame.
     for write in &mut update.writes {
-      if is_kitty_unicode(write.overlay.image.placement.as_ref()) {
+      if is_kitty_unicode(write.overlay.image.placement.as_ref()) && !write.refresh {
         write_protocol_overlay(writer, write.overlay, write.refresh)?;
         write.prewritten = true;
       }
@@ -168,7 +174,10 @@ impl ProtocolOverlayRenderer {
     commit: ProtocolOverlayCommit<'_>,
   ) -> Result<()> {
     for write in commit.writes {
-      if !write.prewritten {
+      if !write.prewritten && !is_kitty_unicode(write.overlay.image.placement.as_ref()) {
+        if write.replace_placement {
+          write_erase_sequences(writer, [write.overlay.image.erase.as_deref()])?;
+        }
         write_protocol_overlay(writer, write.overlay, write.refresh)?;
       }
     }
@@ -197,14 +206,6 @@ impl ProtocolOverlayRenderer {
       .partition(ProtocolOverlayState::is_kitty_unicode);
     self.state = kept;
     erase_states(writer, &cleared)
-  }
-
-  pub(super) fn is_empty(&self) -> bool {
-    self.state.is_empty()
-  }
-
-  pub(super) fn areas(&self) -> impl Iterator<Item = Rect> + '_ {
-    self.state.iter().map(|state| state.area)
   }
 
   fn update<'a>(&self, overlays: &'a [ProtocolOverlay]) -> ProtocolOverlayUpdate<'a> {
@@ -329,10 +330,22 @@ impl ProtocolOverlayRenderer {
           subtract_rects(overlay.area, &unchanged_old_areas)
         },
         refresh: overlay.image.refresh.is_some()
-          && self
-            .state
-            .iter()
-            .any(|old| old.same_placement(&state) && old.fingerprint == state.fingerprint),
+          && self.state.iter().any(|old| {
+            (old.same_placement(&state)
+              || matches!(
+                (old.placement, state.placement),
+                (Some(ProtocolPlacement::KittyPlacement { image_id: a, .. }),
+                 Some(ProtocolPlacement::KittyPlacement { image_id: b, .. })) if a == b
+              ))
+              && old.fingerprint == state.fingerprint
+          }),
+        replace_placement: matches!(
+          state.placement,
+          Some(ProtocolPlacement::KittyPlacement { .. })
+        ) && self
+          .state
+          .iter()
+          .any(|old| old.same_placement(&state) && old.refresh != state.refresh),
         state,
         prewritten: false,
       })

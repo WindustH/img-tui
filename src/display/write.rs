@@ -68,17 +68,19 @@ pub(super) fn write_protocol_overlay(
   overlay: &ProtocolOverlay,
   refresh: bool,
 ) -> Result<()> {
-  // A U=1 image's screen position comes entirely from its placeholder text
-  // cells. When the same image moves, the regular terminal diff relocates
-  // those cells; creating another virtual placement would be redundant and
-  // can leave multiple placements competing for the same image id.
   let image = &overlay.image;
-  if refresh
-    && matches!(
-      image.placement,
-      Some(ProtocolPlacement::KittyUnicode { .. })
-    )
-  {
+  if matches!(
+    image.placement,
+    Some(ProtocolPlacement::KittyUnicode { .. })
+  ) {
+    // Virtual placements have no cursor position. In particular, do not make
+    // tmux synchronize a cursor move (and sleep) for every uploaded slice.
+    let data = if refresh {
+      image.refresh.as_deref().unwrap_or(&image.data)
+    } else {
+      &image.data
+    };
+    writer.write_all(data.as_bytes())?;
     return Ok(());
   }
   if matches!(
